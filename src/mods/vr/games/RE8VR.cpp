@@ -671,7 +671,6 @@ void RE8VR::fix_player_camera(::REManagedObject* player_camera) {
 
                 if (current_camera_offset_ptr != nullptr) {
                     auto current_camera_offset = *current_camera_offset_ptr;
-                    current_camera_offset.y = 0.0f;
                     camera_pos += camera_rot * current_camera_offset;
                     camera_pos.w = 1.0f;
                 }
@@ -714,7 +713,7 @@ void RE8VR::fix_player_camera(::REManagedObject* player_camera) {
         const auto rot_delta = glm::inverse(camera_rot_pre_hmd) * camera_rot;
 
         auto forward = rot_delta * Vector3f{0.0f, 0.0f, 1.0f};
-        forward = glm::normalize(Vector3f{forward.x, 0.0, forward.z});
+        forward = glm::normalize(Vector3f{forward.x, forward.y, forward.z});
 
         sdk::set_joint_position(camera_joint, camera_pos_pre_hmd);
         sdk::set_joint_rotation(camera_joint, camera_rot_pre_hmd * utility::math::to_quat(forward));
@@ -737,105 +736,10 @@ void RE8VR::fix_player_camera(::REManagedObject* player_camera) {
                                                             0, 0, -1, 0,
                                                             0, 0, 0, 1}};
 
-    const auto fixed_dir = glm::normalize((neg_forward_identity * camera_rot_no_shake) * Vector3f{0.0f, 0.0f, -1.0f});
+
+    const auto fixed_dir = glm::normalize(camera_rot * Vector3f{0.0f, 0.0f, -1.0f});
     const auto fixed_rot = utility::math::to_quat(fixed_dir);
 
-     // RE8 pre oct14 update
-    auto camera_rotation_field = sdk::get_object_field<glm::quat>(player_camera, "<CameraRotation>k__BackingField");
-
-    if (camera_rotation_field == nullptr) {
-        camera_rotation_field = sdk::get_object_field<glm::quat>(player_camera, "<cameraRotation>k__BackingField");
-    }
-
-    *camera_rotation_field = fixed_rot;
-
-     // RE8 pre oct14 update
-    auto camera_position_field = sdk::get_object_field<glm::vec4>(player_camera, "<CameraPosition>k__BackingField");
-
-    if (camera_position_field == nullptr) {
-        camera_position_field = sdk::get_object_field<glm::vec4>(player_camera, "<cameraPosition>k__BackingField");
-    }
-
-    *camera_position_field = camera_pos;
-
-#ifdef RE8
-    // RE8 pre oct14 update
-    auto fixed_aim_rotation_field = sdk::get_object_field<glm::quat>(player_camera, "FixedAimRotation");
-
-    if (fixed_aim_rotation_field == nullptr) {
-        fixed_aim_rotation_field = sdk::get_object_field<glm::quat>(player_camera, "<fixedAimRotation>k__BackingField");
-    }
-
-    *fixed_aim_rotation_field = fixed_rot;
-#endif
-
-    auto camera_rotation_with_movement_shake_field = sdk::get_object_field<glm::quat>(player_camera, "CameraRotationWithMovementShake");
-
-    if (camera_rotation_with_movement_shake_field == nullptr) {
-        camera_rotation_with_movement_shake_field = sdk::get_object_field<glm::quat>(player_camera, "cameraRotationWithMovementShake");
-    }
-
-    auto camera_rotation_with_camera_shake_field = sdk::get_object_field<glm::quat>(player_camera, "CameraRotationWithCameraShake");
-
-    if (camera_rotation_with_camera_shake_field == nullptr) {
-        camera_rotation_with_camera_shake_field = sdk::get_object_field<glm::quat>(player_camera, "cameraRotationWithCameraShake");
-    }
-
-    auto prev_camera_rotation_field = sdk::get_object_field<glm::quat>(player_camera, "PrevCameraRotation");
-
-    if (prev_camera_rotation_field == nullptr) {
-        prev_camera_rotation_field = sdk::get_object_field<glm::quat>(player_camera, "PrevcameraRotation"); // ???? why
-    }
-
-    *camera_rotation_with_movement_shake_field = fixed_rot;
-    *camera_rotation_with_camera_shake_field = fixed_rot;
-    *prev_camera_rotation_field = fixed_rot;
-
-    auto camera_controller_param = sdk::get_object_field<::REManagedObject*>(player_camera, "CameraCtrlParam");
-
-    if (camera_controller_param != nullptr) {
-        *sdk::get_object_field<glm::quat>(*camera_controller_param, "CameraRotation") = fixed_rot;
-    }
-
-    if (base_transform_solver != nullptr && *base_transform_solver != nullptr) {
-        auto camera_controller = sdk::get_object_field<::REManagedObject*>(*base_transform_solver, "CurrentController");
-
-        if (camera_controller == nullptr) {
-            camera_controller = sdk::get_object_field<::REManagedObject*>(*base_transform_solver, "<CurrentController>k__BackingField");
-        }
-
-        if (camera_controller != nullptr && *camera_controller != nullptr) {
-            auto camera_controller_rot = glm::identity<glm::quat>();
-
-            if (m_is_in_cutscene) {
-#ifdef RE7
-                camera_controller_rot = *sdk::get_object_field<glm::quat>(*camera_controller, "<rotation>k__BackingField");
-#else
-                camera_controller_rot = *sdk::get_object_field<glm::quat>(*camera_controller, "<Rotation>k__BackingField");
-#endif
-            } else {
-                camera_controller_rot = fixed_rot;
-            }
-
-            camera_controller_rot = utility::math::flatten(camera_controller_rot);
-            
-            if (!m_is_in_cutscene || is_maximum_controllable) {
-                if (!m_is_in_cutscene) {
-                    vr->recenter_view();
-                }
-#ifdef RE7
-                *sdk::get_object_field<glm::quat>(*camera_controller, "<rotation>k__BackingField") = camera_controller_rot;
-#else
-                *sdk::get_object_field<glm::quat>(*camera_controller, "<Rotation>k__BackingField") = camera_controller_rot;
-#endif
-            }
-
-            *sdk::get_object_field<glm::quat>(*base_transform_solver, "<rotation>k__BackingField") = camera_controller_rot;
-            *sdk::get_object_field<bool>(*camera_controller, "IsVerticalRotateLimited") = is_maximum_controllable;
-
-            m_camera_data.was_vert_limited = true;
-        }
-    }
 
     struct Ray {
         glm::vec4 from;
