@@ -165,6 +165,45 @@ dereferences garbage and crashes.
 
 ---
 
+### 2.10 GUI-camera projection hook — **T2 (multi-pattern fallback)**
+- **Where:** `src/mods/VR.cpp` → `hijack_camera` (the `g_projection_matrix_hook2` install).
+- **What:** the via.render GUI camera's get_ProjectionMatrix. The LEGACY byte pattern silently
+  stopped matching on TDB>=74 (the historical "world-space GUI is invisible on Wilds" — elements
+  world-placed but projected with the stock ortho). Now a 3-pattern fallback chain (incl.
+  `"48 89 F2 E8"`-style for TDB>=74); a diagnostic fire-counter log confirms installation.
+- **Re-derive:** find get_ProjectionMatrix via TDB reflection, disassemble the call site the old
+  pattern anchored on, cut a new site pattern. Verify with the `GUI camera proj hook fired` log.
+
+### 2.11 NGX (DLSS) depth/MV harvest — **T1-ish (driver-facing, not game-facing)**
+- **Where:** `src/mods/vr/Flat3DNGX.cpp`.
+- **What:** inline-hooks the game's own `NVSDK_NGX_D3D12_CreateFeature/EvaluateFeature/Release`
+  (resolved from the loaded nvngx module by export, not by game pattern) and reads the parameter
+  block for exact full-res depth/MV/scales. Immune to game updates; sensitive only to NGX SDK
+  parameter-name changes (stable for years). HARD RULE: never record compute/rootsig/heap state on
+  the game's DLSS command list (NV driver deferred-binding null-deref at +0x6b9755); copies and
+  barriers only, or use an own queue-ordered CommandContext.
+
+### 2.12 Overlay-RT GUI redirect — **T0 (no game constants at all)** ✅
+- **Where:** `src/mods/vr/Flat3DGuiRedirect.{hpp,cpp}`.
+- **Why it's update-proof:** after `create_target_state` proved unresolvable on Wilds (anchor
+  strings deleted; target creation moved behind a name-hash registry) and
+  `create_render_target_view` device-removed from layer hooks (§2.9), the redirect was rebuilt at
+  the D3D12 DRIVER level: safetyhook detours on vtable entries (CreateRenderTargetView,
+  CopyTextureRegion, CopyResource, OMSetRenderTargets) taken from OUR OWN device/command-list
+  objects (same implementation class as the engine's). Scoping needs no engine knowledge: the
+  pre/post overlay clone copies VR.cpp already records bracket the GUI draw in-stream and surface
+  as copy calls with known dst resources = markers. The overlay target's own RTV descriptor
+  predates hook install, so it can never be in the handle map — the ONLY unknown single-RTV bind
+  inside the GUI window is the main target: learn it, hijack it (`learned main-target RTV handle`
+  log). Frame-phase gotcha: world-anchored GUI content is projected during the game UPDATE phase,
+  one frame-counter tick behind the render — captures belong in the OPPOSITE eye slot.
+
+### 2.13 Offline re-derivation toolkit — `tools/wilds_re/` ✅
+- pefile+capstone+numpy static analysis of the game exe: string→xref→disasm-window→pattern
+  workflow, `.pdata` function-span index, executor dispatch-table dumper. Use it to VALIDATE any
+  new byte pattern for uniqueness offline before shipping a runtime scan. See its README for the
+  full playbook (reflection > string anchor > structure scan > runtime learn > D3D12-level).
+
 ## 3. Triage recipe after a Wilds update
 
 1. **Black screen (no crash):** the harvest produced nothing. Most likely §2.4 (`copy_engine` pattern
