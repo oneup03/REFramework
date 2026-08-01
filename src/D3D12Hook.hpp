@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <iostream>
 #include <functional>
 
@@ -42,6 +43,13 @@ public:
     void on_resize_buffers(OnResizeBuffersFn fn) {
         m_on_resize_buffers = fn;
     }
+
+    // Flat3D native-output override: when enabled, ResizeBuffers substitutes the containing
+    // display's physical resolution (pixel-exact interlace/checker/LeiaSR) and records what the
+    // engine actually asked for; the flat3d compose samples the believed sub-region.
+    static inline std::atomic<bool> s_force_native_resolution{false};
+    uint32_t get_engine_believed_width() const { return m_engine_believed_width; }
+    uint32_t get_engine_believed_height() const { return m_engine_believed_height; }
 
     void on_resize_target(OnResizeTargetFn fn) {
         m_on_resize_target = fn;
@@ -109,6 +117,8 @@ protected:
     IDXGISwapChain3* m_swapchain_1{};
     ID3D12CommandQueue* m_command_queue{ nullptr };
     UINT m_display_width{ NULL };
+    uint32_t m_engine_believed_width{0};
+    uint32_t m_engine_believed_height{0};
     UINT m_display_height{ NULL };
     UINT m_render_width{ NULL };
     UINT m_render_height{ NULL };

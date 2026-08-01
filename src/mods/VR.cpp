@@ -68,6 +68,7 @@
 #include "FirstPerson.hpp"
 #include "ManualFlashlight.hpp"
 #include "TemporalUpscaler.hpp"
+#include "vr/Flat3DGuiRedirect.hpp"
 #include "VR.hpp"
 
 bool inside_on_end = false;
@@ -120,6 +121,12 @@ void VR::on_view_get_size(REManagedObject* scene_view, float* result) {
     }
 
     if (m_disable_backbuffer_size_override) {
+        return;
+    }
+
+    // Flatscreen 3D: the game renders at its own native resolution and display
+    // mode; no HMD sizing or display-type forcing.
+    if (is_using_flat3d()) {
         return;
     }
 
@@ -286,6 +293,45 @@ void VR::on_camera_get_projection_matrix(REManagedObject* camera, Matrix4x4f* re
     }
 #endif
 
+    if (is_using_flat3d()) {
+        // Keep the game's own projection (FoV/aspect/near/far untouched); add
+        // only the horizontal off-axis shear that provides convergence.
+        const auto count = get_eye_pass_index();
+        const auto is_left = count % 2 == m_left_eye_interval;
+
+        if (is_left) {
+            m_flat3d_game_p00 = (*result)[0][0];
+            m_flat3d_game_p11 = (*result)[1][1];
+        }
+
+        const auto dir = is_left ? m_flat3d->shear_dir_left : -m_flat3d->shear_dir_left;
+        const auto pre_shear = *result; // game projection before our convergence shear
+
+        // AFW renders PARALLEL (shear-free): the plugin's reprojection is translation-driven and
+        // ignores the shear, which parked the skybox at screen depth in the warped eye. Convergence
+        // moves to the compose as the equivalent per-eye image shift (build_flat3d_params), applied
+        // identically to both eyes - infinity lands at proper depth in both.
+        if (!is_using_flat3d_afw()) {
+            (*result)[2][0] += dir * (m_flat3d->separation_eff * 0.5f / m_flat3d->convergence) * (*result)[0][0];
+        }
+
+        // AFW: record BOTH eyes' projections same-tick (this pass's sheared one + the opposite
+        // shear). Present-time warp indexes by its own fill parity.
+        if (is_using_afr()) {
+            const uint32_t e = is_left ? 0u : 1u;
+            if (is_using_flat3d_afw()) {
+                // Parallel projections: both eyes share the unsheared matrix.
+                m_afw_frame.proj[e] = pre_shear;
+                m_afw_frame.proj[e ^ 1] = pre_shear;
+            } else {
+                m_afw_frame.proj[e] = *result;
+                m_afw_frame.proj[e ^ 1] = pre_shear;
+                m_afw_frame.proj[e ^ 1][2][0] += -dir * (m_flat3d->separation_eff * 0.5f / m_flat3d->convergence) * pre_shear[0][0];
+            }
+        }
+        return;
+    }
+
     // Get the projection matrix for the correct eye
     // For some reason we need to flip the projection matrix here?
     *result = get_current_projection_matrix(false);
@@ -296,7 +342,10 @@ Matrix4x4f* VR::gui_camera_get_projection_matrix_hook(REManagedObject* camera, M
 
     auto& vr = VR::get();
 
-    if (result == nullptr || !g_framework->is_ready() || !vr->is_hmd_active() || vr->m_disable_gui_camera_projection_matrix_override) {
+    if (result == nullptr || !g_framework->is_ready() || !vr->is_hmd_active() || vr->m_disable_gui_camera_projection_matrix_override || vr->is_using_flat3d()) {
+        // Flatscreen 3D: the GUI camera stays fully game-controlled - the overlay-RT redirect
+        // handles GUI depth at compose time (the retired world-space GUI experiment substituted
+        // the scene perspective here).
         return original_func(camera, result);
     }
 
@@ -348,6 +397,36 @@ void VR::on_camera_get_view_matrix(REManagedObject* camera, Matrix4x4f* result) 
         const auto current_eye_transform = get_current_eye_transform(true);
         //auto current_head_pos = -(glm::inverse(vr->get_rotation(0)) * ((vr->get_position(0)) - vr->m_standing_origin));
         //current_head_pos.w = 0.0f;
+
+        // AFW: record BOTH eyes' views same-tick from this tick's base matrix (this pass's transform
+        // + the opposite one). Present-time warp indexes by its own fill parity.
+        if (is_using_flat3d() && is_using_afr()) {
+            const auto other_eye_transform = get_current_eye_transform(false);
+            const auto count = get_eye_pass_index();
+            const uint32_t e = (count % 2 == m_left_eye_interval) ? 0u : 1u;
+            m_afw_frame.view[e] = current_eye_transform * mtx;
+            m_afw_frame.view[e ^ 1] = other_eye_transform * mtx;
+            m_afw_frame.rfc = (int32_t)m_render_frame_count;
+            m_afw_frame.valid = true;
+            // Frame-stamped ring copy (proj hook filled m_afw_frame.proj earlier this tick):
+            // present-time consumers pick THEIR frame's matrices even when the game thread has
+            // already recorded the next frame's.
+            m_afw_frame_ring[m_afw_frame.rfc & 3] = m_afw_frame;
+
+            // ALTERNATION PROBE: does the RENDER actually alternate eyes frame to frame? Ring of the
+            // last 6 applied-transform X offsets + pass parities, dumped as one line periodically.
+            static uint32_t s_n = 0;
+            static float s_x[6];
+            static uint32_t s_p[6];
+            s_x[s_n % 6] = current_eye_transform[3].x;
+            s_p[s_n % 6] = e;
+            ++s_n;
+            if (m_flat3d_afw_debug->value() && s_n % 300 == 0) {
+                spdlog::info("[Flat3D-AFW] viewhook ring: p=[{},{},{},{},{},{}] x=[{:.3f},{:.3f},{:.3f},{:.3f},{:.3f},{:.3f}]",
+                    s_p[0], s_p[1], s_p[2], s_p[3], s_p[4], s_p[5],
+                    s_x[0], s_x[1], s_x[2], s_x[3], s_x[4], s_x[5]);
+            }
+        }
 
         // Apply the complete eye transform. This fixes the need for parallel projections on all canted headsets like Pimax
         mtx = current_eye_transform * mtx;
@@ -469,8 +548,66 @@ bool VR::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* r
     // just don't render anything at all.
     // overlays just seem to break stuff in VR.
     if (!is_hmd_active()) {
+        vrmod::Flat3DGuiRedirect::get().disarm(); // never leave the GUI redirect armed while inactive
         return true;
     }
+
+    // Flatscreen 3D: never suppress engine overlays; they render fine on a flat screen. The
+    // per-eye harvest runs at the POST-overlay hook (on_overlay_layer_draw) so the HUD the overlay
+    // draws INTO the main target is captured - copying here (pre-draw) misses it entirely.
+    if (is_using_flat3d()) {
+        // AFW hudless capture (AFR, single scene layer): clone+copy the overlay's main target BEFORE
+        // the GUI draws. Feeds the plugin's ExtractUI so the warp re-composites the UI unwarped
+        // (fixes GUI slicing). Reuses the multipass pre_left machinery downstream.
+        if (is_using_flat3d_afw() && !is_using_multipass() && g_framework->is_dx12()
+                && !TemporalUpscaler::get()->ready()) {
+            const auto main_ts = layer->get_main_target_state().get();
+            const auto rtv = main_ts != nullptr ? main_ts->get_rtv(0) : nullptr;
+            const auto src = rtv != nullptr ? rtv->get_texture_d3d12() : nullptr;
+
+            if (src != nullptr) {
+                // Overlay-RT redirect: publish this frame's resources BEFORE recording the marker
+                // copy. The pre/post clone copies below/in the post-hook are the in-stream markers
+                // the D3D12-level redirect keys on (see Flat3DGuiRedirect).
+                if (m_multipass.pre_left_texture.Get() != nullptr
+                        && m_multipass.pre_right_texture.Get() != nullptr) {
+                    const auto target_native = (ID3D12Resource*)sdk::renderer::get_engine_native_resource_d3d12(src.get());
+                    // Same fresh-eye parity D3D12Component uses at present time for this frame.
+                    const uint32_t fresh_eye = ((uint32_t)m_render_frame_count % 2 == (uint32_t)m_left_eye_interval) ? 0u : 1u;
+                    // World-anchored GUI positions are computed during the game UPDATE phase,
+                    // before this frame's counter increment - the content carries the PREVIOUS
+                    // frame's eye projection, so it belongs in the OPPOSITE slot (user-validated).
+                    const uint32_t capture_eye = fresh_eye ^ 1u;
+                    vrmod::Flat3DGuiRedirect::get().arm(target_native,
+                        m_multipass.pre_left_texture.Get(), m_multipass.pre_right_texture.Get(), capture_eye);
+                } else {
+                    vrmod::Flat3DGuiRedirect::get().disarm();
+                }
+
+                if (m_multipass.pre_left_copy == nullptr) {
+                    m_multipass.pre_left_copy = src->clone();
+                    if (m_multipass.pre_left_copy != nullptr) {
+                        sdk::renderer::prime_copy_dest_state(m_multipass.pre_left_copy.get());
+                        m_multipass.pre_left_texture =
+                            (ID3D12Resource*)sdk::renderer::get_engine_native_resource_d3d12(m_multipass.pre_left_copy.get());
+                        spdlog::info("[Flat3D-AFW] hudless clone={:x} native={:x}",
+                            (uintptr_t)m_multipass.pre_left_copy.get(), (uintptr_t)m_multipass.pre_left_texture.Get());
+                    }
+                } else {
+                    ((sdk::renderer::RenderContext*)render_ctx)->copy_texture(m_multipass.pre_left_copy.get(), src.get());
+                }
+            }
+            return true;
+        }
+
+        // Not the AFW path this frame - make sure the GUI redirect can't hijack anything.
+        vrmod::Flat3DGuiRedirect::get().disarm();
+
+        return true;
+    }
+
+    // Flat3D off entirely: the redirect must never stay armed.
+    vrmod::Flat3DGuiRedirect::get().disarm();
 
     // NOT RE3
     // for some reason RE3 has weird issues with the overlay rendering
@@ -485,6 +622,73 @@ bool VR::on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* r
     }
 
     return false;
+}
+
+void VR::on_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* render_ctx) {
+    // Flat3D per-eye harvest, POST-overlay: the Overlay's main target holds this eye's finished
+    // scene + HUD (the overlay draw composited the HUD onto it). Copy it into this eye's clone
+    // in-stream (engine state-tracked); the clones are tile-backed in D3D12Component so it lands.
+    if (!is_using_flat3d() || !g_framework->is_dx12() || TemporalUpscaler::get()->ready()) {
+        return;
+    }
+
+
+    const auto scene_layers = m_camera_duplicator.get_relevant_scene_layers();
+    const auto parent = (sdk::renderer::layer::Scene*)layer->get_parent();
+
+    // AFW (AFR + warp): single camera, single scene layer. NO engine copies here - the engine's
+    // copy_texture executor CRASHES on Wilds for depth (and cloning is fragile). Instead we just
+    // capture the LIVE depth/MV natives; run_flat3d_afw copies them at present time with OUR OWN
+    // command list + explicit barriers (frame is complete by then, engine tracker untouched).
+    if (is_using_flat3d_afw() && !is_using_multipass() && parent != nullptr) {
+        const auto depth_native = parent->get_depth_stencil_d3d12();
+        const auto mv_native = parent->get_motion_vectors_d3d12();
+
+        if (depth_native != nullptr && mv_native != nullptr) {
+            if (m_afw_depth_tex.Get() != (ID3D12Resource*)depth_native || m_afw_mv_tex.Get() != (ID3D12Resource*)mv_native) {
+                m_afw_depth_tex = (ID3D12Resource*)depth_native;
+                m_afw_mv_tex = (ID3D12Resource*)mv_native;
+                spdlog::info("[Flat3D-AFW] live natives: depth={:x} mv={:x}",
+                    (uintptr_t)m_afw_depth_tex.Get(), (uintptr_t)m_afw_mv_tex.Get());
+            }
+
+            // Snapshot NOW (mid-frame): at present time the engine may already have cleared the
+            // depth (observed as all-zero readbacks -> flat duplicated warp).
+            m_d3d12.afw_snapshot_depth_mv(this, (ID3D12Resource*)depth_native, (ID3D12Resource*)mv_native);
+        }
+
+        // Same-stage POST-overlay capture: clone the main target right AFTER the GUI drew into it.
+        // Paired with the PRE-overlay clone this brackets the GUI draw exactly, so the ExtractUI
+        // diff is clean - the old backbuffer-vs-hudless diff spanned post-GUI passes and produced
+        // alpha garbage. Reuses the dormant pre_right slots.
+        {
+            const auto main_ts = layer->get_main_target_state().get();
+            const auto rtv = main_ts != nullptr ? main_ts->get_rtv(0) : nullptr;
+            const auto src = rtv != nullptr ? rtv->get_texture_d3d12() : nullptr;
+
+            if (src != nullptr) {
+                if (m_multipass.pre_right_copy == nullptr) {
+                    m_multipass.pre_right_copy = src->clone();
+                    if (m_multipass.pre_right_copy != nullptr) {
+                        sdk::renderer::prime_copy_dest_state(m_multipass.pre_right_copy.get());
+                        m_multipass.pre_right_texture =
+                            (ID3D12Resource*)sdk::renderer::get_engine_native_resource_d3d12(m_multipass.pre_right_copy.get());
+                        spdlog::info("[Flat3D-AFW] post-overlay clone={:x} native={:x}",
+                            (uintptr_t)m_multipass.pre_right_copy.get(), (uintptr_t)m_multipass.pre_right_texture.Get());
+                    }
+                } else {
+                    ((sdk::renderer::RenderContext*)render_ctx)->copy_texture(m_multipass.pre_right_copy.get(), src.get());
+                }
+            }
+        }
+        return; // AFR: no multipass per-eye harvest below
+    }
+
+    // (flat3d multipass per-eye harvest removed - AFR+AFW is the flat3d path)
+}
+
+void VR::on_output_layer_draw(sdk::renderer::layer::Output* layer, void* render_ctx) {
+    // (flat3d multipass output harvest removed)
 }
 
 bool VR::on_pre_overlay_layer_update(sdk::renderer::layer::Overlay* layer, void* render_ctx) {
@@ -552,9 +756,82 @@ bool VR::on_pre_scene_layer_draw(sdk::renderer::layer::Scene* layer, void* rende
     return true;
 }
 
+// Flatscreen 3D multipass harvest via engine-side RTV-swap redirect (the robust path on
+// MHWilds, where reading engine targets externally races the GPU -> driver crash). Before
+// each eye's PrepareOutput draws, we swap the output target's rtv[0] with our per-eye clone
+// so the engine renders that eye INTO our private texture. Because the engine renders into
+// it, it's state-tracked; we read it at PRESENT (never mid-frame) so there's no race.
+// create_render_target_view resolves on MHWilds; create_target_state does not, so we swap
+// the RTV (set_rtv) rather than clone the whole TargetState + set_output_state.
+bool VR::on_pre_prepare_output_layer_draw(sdk::renderer::layer::PrepareOutput* layer, void* render_context) {
+    // RTV-swap redirect: clone this eye's output RTV and set_rtv it into the eye's output
+    // target so the engine renders the eye into OUR private texture, which we read at
+    // present. create_render_target_view now resolves the RTV descriptor-pool device from a
+    // render-system global (it's NOT thread-local - see the SDK), so the clone succeeds.
+    if (!is_hmd_active() || !is_using_flat3d() || !is_using_multipass()) {
+        return true;
+    }
+
+    // With the upscaler active it owns the scene-layer redirect and provides the eye
+    // textures directly; don't fight it.
+    if (TemporalUpscaler::get()->ready()) {
+        return true;
+    }
+
+    auto scene_layers = m_camera_duplicator.get_relevant_scene_layers();
+
+    if (scene_layers.size() < 2) {
+        return true;
+    }
+
+    const auto parent_layer = layer->get_parent();
+
+    if (parent_layer == nullptr) {
+        return true;
+    }
+
+    // The RTV-swap redirect is ABANDONED: create_render_target_view device-removes the GPU
+    // when called from this hook (proven by isolation - create_texture alone is safe, adding
+    // create_render_target_view crashes). Flat3D instead uses the SAME proven copy-harvest as
+    // VR multipass: native_res_copies are created (via create_texture) in on_end_rendering and
+    // each eye's prepared color is copied into them, in-stream, by on_prepare_output_layer_draw
+    // (context->copy_texture). Nothing to do in this pre-hook anymore.
+    (void)parent_layer;
+    (void)layer;
+
+    return true;
+}
+
 void VR::on_prepare_output_layer_draw(sdk::renderer::layer::PrepareOutput* layer, void* render_context) {
     if (!is_hmd_active()) {
         return;
+    }
+
+    // Flatscreen 3D: keep an engine-side depth clone fresh for the
+    // auto-convergence / dynamic-crosshair readback. Uses the engine's own
+    // copy command, which handles resource states for us. SKIPPED under AFW: the engine's
+    // copy_texture of DEPTH device-removes on Wilds (the original AFW lesson - this path caused a
+    // D3D12 reinit loop the moment auto-convergence was first enabled); the sampler gets the
+    // DLSS-harvested io depth as its external source instead.
+    // PERMANENTLY disabled for flat3d: the engine's copy_texture of depth device-removes on Wilds
+    // (this fired the moment AFW was unchecked with auto-convergence on - the !is_using_flat3d_afw
+    // gate re-armed it). The depth sampler's ONLY source under flat3d is the DLSS external one.
+    if (false && is_using_flat3d()
+            && (m_flat3d_auto_convergence->value() || m_flat3d_dynamic_crosshair->value())) {
+        const auto scene_layer = (sdk::renderer::layer::Scene*)layer->get_parent();
+
+        if (scene_layer != nullptr) {
+            auto is_primary = true;
+
+            if (is_using_multipass()) {
+                auto scene_layers = m_camera_duplicator.get_relevant_scene_layers();
+                is_primary = !scene_layers.empty() && layer->get_parent() == scene_layers[0];
+            }
+
+            if (is_primary) {
+                m_flat3d_depth_sampler.update_engine_copy((sdk::renderer::RenderContext*)render_context, scene_layer);
+            }
+        }
     }
 
     if (!is_using_multipass()) {
@@ -572,6 +849,11 @@ void VR::on_prepare_output_layer_draw(sdk::renderer::layer::PrepareOutput* layer
     if (scene_layer == nullptr) {
         return;
     }
+
+    // Flatscreen 3D uses the SAME copy-harvest as VR multipass below: copy each eye's
+    // prepared color into its native_res_copies clone via the engine's in-stream
+    // context->copy_texture (safe - engine state tracking, GPU-timeline ordered, no race).
+    // The RTV-swap redirect was abandoned (create_render_target_view crashes the GPU).
 
     const auto output_state = layer->get_output_state();
 
@@ -600,6 +882,13 @@ void VR::on_prepare_output_layer_draw(sdk::renderer::layer::PrepareOutput* layer
     const auto parent_layer = layer->get_parent();
 
     if (parent_layer == nullptr) {
+        return;
+    }
+
+    // Flat3D harvests at the PRE-OVERLAY hook instead (on_pre_overlay_layer_draw): the shared
+    // output target is still BLACK here (the final composite lands between this hook and the
+    // overlay), so copying now would capture nothing. Skip the VR harvest below for flat3d.
+    if (is_using_flat3d()) {
         return;
     }
 
@@ -729,11 +1018,23 @@ void VR::on_scene_layer_update(sdk::renderer::layer::Scene* layer, void* render_
                 d.scene_info->inverse_view_projection_matrix = glm::inverse(d.scene_info->view_projection_matrix);
             }*/
 
-            if (is_multipass && !is_temporal_upscaler_active) {
+            // Per-eye 2-slot history (feeds the game's DLSS/FSR/TAA the correct
+            // previous-eye view-projection so it reprojects the opposite-eye
+            // history into this eye instead of using it un-reprojected). This
+            // needs the render cadence to ALTERNATE eyes frame-by-frame, which
+            // holds for multipass and for Flat3D AFR. Flat3D SEQUENTIAL renders
+            // BOTH eyes inside one game frame, so get_game_frame_count() does not
+            // distinguish them - post_setup's 2 slots collapse and it feeds TAA a
+            // wrong previous matrix, smearing the whole screen on motion. So
+            // sequential (and normal VR non-multipass, which submits each eye
+            // separately) take the "freeze" path instead.
+            const auto flat3d_afr = is_using_flat3d() && is_using_afr();
+
+            if ((is_multipass || flat3d_afr) && !is_temporal_upscaler_active) {
                 const auto frame = this->get_game_frame_count();
                 d.post_setup(frame);
             } else if (!is_temporal_upscaler_active) {
-                // TAA fix
+                // TAA fix / freeze
                 d.scene_info->old_view_projection_matrix = d.view_projection_matrix;
             }
         }
@@ -750,7 +1051,8 @@ void VR::wwise_listener_update_hook(void* listener) {
 
     auto& mod = VR::get();
 
-    if (!mod->is_hmd_active() || !mod->get_runtime()->loaded) {
+    // Flatscreen 3D: no HMD to orient audio to; leave the listener alone.
+    if (!mod->is_hmd_active() || !mod->get_runtime()->loaded || mod->is_using_flat3d()) {
         original_func(listener);
         return;
     }
@@ -834,10 +1136,17 @@ std::optional<std::string> VR::on_initialize_d3d_thread() try {
             m_openxr->needs_pose_update = false;
         }
     } else {
-        m_openxr->error = 
+        m_openxr->error =
 R"(OpenVR loaded first.
-If you want to use OpenXR, remove the openvr_api.dll from your game folder, 
+If you want to use OpenXR, remove the openvr_api.dll from your game folder,
 and place the openxr_loader.dll in the same folder.)";
+    }
+
+    // Flatscreen 3D: no HMD runtime required. Always active when no real VR
+    // runtime is present (the enable option is retired - this build IS the
+    // flatscreen-3D build).
+    if (!m_openvr->loaded && !m_openxr->loaded) {
+        initialize_flat3d();
     }
 
     if (!get_runtime()->loaded) {
@@ -907,6 +1216,7 @@ and place the openxr_loader.dll in the same folder.)";
     m_openvr->loaded = false;
     m_openvr->is_hmd_active = false;
     m_openxr->loaded = false;
+    m_flat3d->loaded = false;
     m_init_finished = false;
 
     return Mod::on_initialize();
@@ -972,6 +1282,124 @@ void VR::on_lua_state_created(sol::state& lua) {
     );
 
     lua["vrmod"] = this;
+}
+
+std::optional<std::string> VR::initialize_flat3d() {
+    spdlog::info("[VR] Initializing Flatscreen 3D output (no HMD)");
+
+    m_flat3d = std::make_shared<runtimes::Flat3D>();
+    m_flat3d->loaded = true;
+    m_flat3d->enabled = true; // stereo always active (the Active toggle is retired)
+    m_runtime = m_flat3d;
+
+    if (g_framework->is_dx12()) {
+        m_d3d12.on_reset(this);
+    } else {
+        m_d3d11.on_reset(this);
+    }
+
+    return Mod::on_initialize();
+}
+
+void VR::update_flat3d_params() {
+    if (m_flat3d == nullptr) {
+        return;
+    }
+
+    // Publish the native-output override to the swapchain hook (ResizeBuffers substitution).
+    // Always on under flat3d (the option is retired).
+    D3D12Hook::s_force_native_resolution.store(is_using_flat3d());
+
+    // FoV-aware separation auto-scaling (always on): screen disparity scales
+    // with sep / tan(half_fov), so scaling the Depth setting by
+    // tan(half_fov_now) / tan(half_fov_reference) keeps perceived depth
+    // constant when the game zooms (aim, cutscenes).
+    const auto p11 = m_flat3d_game_p11.load();
+    auto fov_scale = 1.0f;
+
+    if (p11 > 0.0f) {
+        const auto tan_half_game = 1.0f / p11;
+        const auto tan_half_ref = std::tan(glm::radians(m_flat3d_reference_fov->value()) * 0.5f);
+
+        if (tan_half_ref > 0.0f && tan_half_game > 0.0f) {
+            fov_scale = tan_half_game / tan_half_ref;
+        }
+    }
+
+    // EMA smooths hard FoV cuts (cutscene transitions, weapon zoom pops).
+    m_flat3d_fov_scale_ema += (fov_scale - m_flat3d_fov_scale_ema) * 0.2f;
+
+    auto sep_eff = m_flat3d_depth->value() * m_flat3d_fov_scale_ema;
+    const auto manual_conv = std::max(m_flat3d_convergence->value(), 0.01f); // a distance: no FoV term
+    auto conv_applied = manual_conv;
+
+    // Auto-convergence (dynamic3d 3.3-3.5): pull convergence in so the nearest
+    // significant object stays under the pop-out budget, while co-scaling
+    // separation so BACKGROUND disparity stays locked at the user's calibration.
+    const auto z_near_raw = m_flat3d_auto_convergence->value() ? m_flat3d_depth_sampler.get_nearest_depth() : -1.0f;
+
+    if (z_near_raw > 0.0f) {
+        // Temporal median-of-5 prefilter, then asymmetric EMA with a RELATIVE deadband.
+        m_flat3d_znear_history[m_flat3d_znear_history_idx] = z_near_raw;
+        m_flat3d_znear_history_idx = (m_flat3d_znear_history_idx + 1) % (uint32_t)m_flat3d_znear_history.size();
+        m_flat3d_znear_history_count = std::min<uint32_t>(m_flat3d_znear_history_count + 1, (uint32_t)m_flat3d_znear_history.size());
+
+        auto sorted = m_flat3d_znear_history;
+        std::sort(sorted.begin(), sorted.begin() + m_flat3d_znear_history_count);
+        const auto z_median = sorted[m_flat3d_znear_history_count / 2];
+
+        if (m_flat3d_znear_ema <= 0.0f) {
+            m_flat3d_znear_ema = z_median;
+        } else if (std::abs(z_median - m_flat3d_znear_ema) / m_flat3d_znear_ema > 0.005f) {
+            // Fast toward the camera (comfort), slow away (stability).
+            const auto alpha = z_median < m_flat3d_znear_ema ? 0.20f : 0.05f;
+            m_flat3d_znear_ema += (z_median - m_flat3d_znear_ema) * alpha;
+        }
+
+        const auto p00 = m_flat3d_game_p00.load();
+        const auto k = sep_eff * p00 * 0.25f; // per-eye shift as a fraction of eye width
+
+        if (k > 0.0f && m_flat3d_znear_ema > 0.0f) {
+            const auto target = m_flat3d_max_popout->value() * 0.01f;
+            const auto d_at_manual = k * (1.0f / m_flat3d_znear_ema - 1.0f / manual_conv);
+
+            auto conv_target = manual_conv; // manual value is a CEILING - auto only pulls IN
+
+            if (d_at_manual > target) {
+                conv_target = m_flat3d_znear_ema * (1.0f + target * manual_conv / k);
+                conv_target = std::min(conv_target, manual_conv);
+            }
+
+            conv_target = std::max(conv_target, std::max(m_nearz * 1.5f, 0.01f));
+
+            // Smooth in 1/convergence space - disparity is linear in 1/conv, so
+            // smoothing conv itself would "lunge" as it gets small.
+            const auto target_inv = 1.0f / conv_target;
+
+            if (m_flat3d_inv_conv_ema <= 0.0f) {
+                m_flat3d_inv_conv_ema = target_inv;
+            } else {
+                m_flat3d_inv_conv_ema += (target_inv - m_flat3d_inv_conv_ema) * m_flat3d_autoconv_smoothing->value();
+            }
+
+            conv_applied = std::min(1.0f / m_flat3d_inv_conv_ema, manual_conv);
+
+            // Lock background disparity: sep_eff/conv_applied == sep/manual_conv.
+            const auto depth_scale = std::clamp(conv_applied / manual_conv, 0.1f, 1.0f);
+            sep_eff *= depth_scale;
+        }
+    } else if (m_flat3d_inv_conv_ema > 0.0f || m_flat3d_znear_ema > 0.0f) {
+        // Disabled or no depth data: snap back to manual instantly and reset
+        // all internal state (easing out reads as unexplained drift).
+        m_flat3d_inv_conv_ema = -1.0f;
+        m_flat3d_znear_ema = -1.0f;
+        m_flat3d_znear_history_count = 0;
+        m_flat3d_znear_history_idx = 0;
+    }
+
+    m_flat3d->separation_eff = sep_eff;
+    m_flat3d->convergence = conv_applied;
+    m_flat3d->shear_dir_left = m_flat3d_swap_shear_sign->value() ? -1.0f : 1.0f;
 }
 
 std::optional<std::string> VR::initialize_openvr() {
@@ -1385,12 +1813,22 @@ std::optional<std::string> VR::hijack_camera() {
 
     if (func != nullptr) {
         spdlog::info("via.gui.GUICamera.get_ProjectionMatrix: {:x}", (uintptr_t)func);
-        
-        // Pattern scan for the native function call
-        auto ref = utility::scan((uintptr_t)func, 0x100, "49 8B C8 E8");
+
+        // Pattern scan for the native function call - same fallback set as
+        // Hooks::hook_camera_get_projection_matrix (the old single 49 8B C8 pattern doesn't exist
+        // in newer TDBs; Wilds matches the 48 89 F2 variant).
+        auto ref = utility::find_pattern_in_path((uint8_t*)func, 1000, false, "49 8B C8 E8");
+
+        if (!ref) {
+            ref = utility::find_pattern_in_path((uint8_t*)func, 1000, false, "48 8B CB E8");
+        }
+
+        if (!ref) {
+            ref = utility::find_pattern_in_path((uint8_t*)func, 1000, false, "48 89 F2 E8"); // >= TDB74
+        }
 
         if (ref) {
-            auto native_func = utility::calculate_absolute(*ref + 4);
+            auto native_func = utility::calculate_absolute(ref->addr + 4);
 
             if (native_func != get_projection_matrix) {
                 // Hook the native function
@@ -1402,6 +1840,8 @@ std::optional<std::string> VR::hijack_camera() {
             } else {
                 spdlog::info("Did not hook via.gui.GUICamera.get_ProjectionMatrix, same as via.Camera.get_ProjectionMatrix");
             }
+        } else {
+            spdlog::info("via.gui.GUICamera.get_ProjectionMatrix native call pattern not found - GUI safe-area unavailable");
         }
     }
 
@@ -1601,6 +2041,10 @@ void VR::update_hmd_state() {
         runtime->wants_reset_origin = false;
     }
 
+    if (runtime->is_flat3d()) {
+        update_flat3d_params();
+    }
+
     runtime->update_matrices(m_nearz, m_farz);
 
     runtime->got_first_poses = true;
@@ -1756,20 +2200,24 @@ void VR::update_camera() {
             return;
         }
 
-        auto projection_matrix = is_using_multipass() ? get_projection_matrix(0) : get_current_projection_matrix(true);
+        // Flatscreen 3D: FoV/aspect stay game-controlled, and the runtime's
+        // projections[] are identity placeholders anyway.
+        if (!is_using_flat3d()) {
+            auto projection_matrix = is_using_multipass() ? get_projection_matrix(0) : get_current_projection_matrix(true);
 
-        // Steps towards getting lens flares and volumetric lighting working
-        // Get the FOV from the projection matrix
-        const auto vfov = glm::degrees(2.0f * std::atan(1.0f / projection_matrix[1][1]));
-        const auto aspect = projection_matrix[1][1] / projection_matrix[0][0];
-        const auto hfov = vfov * aspect;
-        
-        //spdlog::info("vFOV: {}", vfov);
-        //spdlog::info("Aspect: {}", aspect);
+            // Steps towards getting lens flares and volumetric lighting working
+            // Get the FOV from the projection matrix
+            const auto vfov = glm::degrees(2.0f * std::atan(1.0f / projection_matrix[1][1]));
+            const auto aspect = projection_matrix[1][1] / projection_matrix[0][0];
+            const auto hfov = vfov * aspect;
 
-        set_fov_method->call<void*>(sdk::get_thread_context(), camera, vfov);
-        set_vertical_enable_method->call<void*>(sdk::get_thread_context(), camera, true);
-        set_aspect_ratio_method->call<void*>(sdk::get_thread_context(), camera, aspect);
+            //spdlog::info("vFOV: {}", vfov);
+            //spdlog::info("Aspect: {}", aspect);
+
+            set_fov_method->call<void*>(sdk::get_thread_context(), camera, vfov);
+            set_vertical_enable_method->call<void*>(sdk::get_thread_context(), camera, true);
+            set_aspect_ratio_method->call<void*>(sdk::get_thread_context(), camera, aspect);
+        }
     }
 
     update_camera_origin();
@@ -1831,6 +2279,12 @@ void VR::update_camera_origin() {
 void VR::apply_hmd_transform(glm::quat& rotation, Vector4f& position) {
     REF_PROFILE_FUNCTION();
 
+    // Flatscreen 3D: no head tracking; camera orientation/position stay
+    // game-controlled. The per-eye offset is applied in the view matrix hook.
+    if (is_using_flat3d()) {
+        return;
+    }
+
     const auto rotation_offset = get_rotation_offset();
     const auto current_hmd_rotation = glm::normalize(rotation_offset * glm::quat{get_rotation(0)});
     
@@ -1858,6 +2312,11 @@ void VR::apply_hmd_transform(glm::quat& rotation, Vector4f& position) {
 
 void VR::apply_hmd_transform(::REJoint* camera_joint) {
     REF_PROFILE_FUNCTION();
+
+    // Flatscreen 3D: leave the joint untouched entirely.
+    if (is_using_flat3d()) {
+        return;
+    }
 
     auto rotation = m_original_camera_rotation;
     auto position = m_original_camera_position;
@@ -2165,15 +2624,37 @@ void VR::disable_bad_effects() {
         }();
     }
 
-    if (m_force_aa_settings->value() && get_antialiasing_method != nullptr && set_antialiasing_method != nullptr) {
-        const auto antialiasing = get_antialiasing_method->call<via::render::RenderConfig::AntiAliasingType>(context, render_config);
+    // Flat3D AFR/sequential MUST drop the game's temporal AA even when the
+    // ForceAntiAliasing toggle is off (it defaults off on TDB>=69 because
+    // multipass normally handles TAA). The game's TAA reprojects using motion
+    // vectors that don't include Flat3D's per-eye camera offset, so it smears the
+    // whole screen on motion and destabilizes foliage. Multipass is unavailable
+    // on MHWilds (upscaler CreateFeature fails), so on Wilds this is the only way
+    // to get a clean image. Switch to SMAA (spatial, no temporal history) rather
+    // than NONE so edges/foliage still get anti-aliased.
+    const auto flat3d_no_temporal = is_using_flat3d() && !is_using_multipass();
 
-        // Disable TAA
+    if ((m_force_aa_settings->value() || flat3d_no_temporal) && get_antialiasing_method != nullptr && set_antialiasing_method != nullptr) {
+        const auto antialiasing = get_antialiasing_method->call<via::render::RenderConfig::AntiAliasingType>(context, render_config);
+        const auto target_aa = flat3d_no_temporal
+            ? via::render::RenderConfig::AntiAliasingType::SMAA
+            : via::render::RenderConfig::AntiAliasingType::NONE;
+
+        if (flat3d_no_temporal) {
+            static via::render::RenderConfig::AntiAliasingType s_last_logged = (via::render::RenderConfig::AntiAliasingType)-1;
+            if (antialiasing != s_last_logged) {
+                s_last_logged = antialiasing;
+                // 0=FXAA 1=TAA 2=FXAA_TAA 3=SMAA 4=NONE
+                spdlog::info("[Flat3D] game AntiAliasing reports {} (0=FXAA 1=TAA 2=FXAA_TAA 3=SMAA 4=NONE)", (int)antialiasing);
+            }
+        }
+
+        // Replace any TEMPORAL AA with the non-temporal target.
         switch (antialiasing) {
             case via::render::RenderConfig::AntiAliasingType::TAA: [[fallthrough]];
             case via::render::RenderConfig::AntiAliasingType::FXAA_TAA:
-                set_antialiasing_method->call<void*>(context, render_config, via::render::RenderConfig::AntiAliasingType::NONE);
-                spdlog::info("[VR] TAA disabled");
+                set_antialiasing_method->call<void*>(context, render_config, target_aa);
+                spdlog::info("[VR] Temporal AA replaced with {}", flat3d_no_temporal ? "SMAA (flat3d)" : "NONE");
                 break;
             default:
                 break;
@@ -2223,7 +2704,9 @@ void VR::disable_bad_effects() {
         // Disable volumetrics
         if (transparent_buffer_quality != via::render::RenderConfig::Quality::NONE) {
             set_transparent_buffer_quality_method->call<void*>(context, render_config, via::render::RenderConfig::Quality::NONE);
-            spdlog::info("[VR] Volumetrics disabled");
+            // The game re-enables this every frame, so we re-disable every frame - but only log once.
+            static bool s_logged_vol = false;
+            if (!s_logged_vol) { s_logged_vol = true; spdlog::info("[VR] Volumetrics disabled"); }
         }
     }
 
@@ -2233,7 +2716,9 @@ void VR::disable_bad_effects() {
         // Disable lensflares
         if (is_lensflare_enabled) {
             set_lensflare_enable_method->call<void*>(context, render_config, false);
-            spdlog::info("[VR] Lensflares disabled");
+            // The game re-enables this every frame, so we re-disable every frame - but only log once.
+            static bool s_logged_lens = false;
+            if (!s_logged_lens) { s_logged_lens = true; spdlog::info("[VR] Lensflares disabled"); }
         }
     }
 
@@ -2275,13 +2760,25 @@ void VR::disable_bad_effects() {
     // Causes crashes on D3D11. May be a performance detriment in VR with new rendering method.
     const auto is_new_rendering_method = get_rendering_technique() == VR::RenderingTechnique::MULTIPASS;
 
-    if (!is_new_rendering_method && !is_sf6 && g_framework->get_renderer_type() == REFramework::RendererType::D3D12 && m_enable_asynchronous_rendering->value()) {
+    // Flat3D true-sequential MUST render synchronously (engine delay-render OFF): its re-run
+    // re-enters BeginRendering/EndRendering every frame, and with delay-render ON (async
+    // pipelining) the render thread runs a frame behind, so two consecutive re-runs overflow
+    // the render pipeline and the next BeginRendering deadlocks. Force delay-render off for it
+    // regardless of the async toggle. (Setting an explicit false here, NOT !async, because for
+    // flat3d the async toggle is off and !false would wrongly re-ENABLE delay-render.)
+    const bool async_wants_delay_off = !is_new_rendering_method && !is_sf6
+        && g_framework->get_renderer_type() == REFramework::RendererType::D3D12
+        && m_enable_asynchronous_rendering->value();
+    const bool flat3d_wants_delay_off = false && is_using_flat3d_true_sequential()
+        && g_framework->get_renderer_type() == REFramework::RendererType::D3D12;
+
+    if (async_wants_delay_off || flat3d_wants_delay_off) {
         if (get_delay_render_enable_method != nullptr && set_delay_render_enable_method != nullptr) {
             const auto is_delay_render_enabled = get_delay_render_enable_method->call<bool>(context);
 
             if (is_delay_render_enabled == true) {
-                set_delay_render_enable_method->call<void*>(context, !m_enable_asynchronous_rendering->value());
-                spdlog::info("[VR] Delay render modified");
+                set_delay_render_enable_method->call<void*>(context, false);
+                spdlog::info("[VR] Delay render modified (disabled)");
             }
         }
     } else if (is_sf6) {
@@ -2436,6 +2933,19 @@ void VR::recenter_gui(const glm::quat& from) {
     set_gui_rotation_offset(new_gui_offset);
 }
 
+uint32_t VR::get_eye_pass_index() const {
+    if (is_using_multipass()) {
+        return m_multipass.pass;
+    }
+    // Flat3D true-sequential: the main render is the LEFT eye; the engine re-run (inside_on_end)
+    // is the RIGHT eye - both at the same tick. Keying off inside_on_end (instead of frame parity)
+    // is what makes the re-run render the OTHER eye rather than "the same eye twice".
+    if (is_using_flat3d() && is_using_sequential()) {
+        return inside_on_end ? 1u : 0u;
+    }
+    return (uint32_t)m_frame_count;
+}
+
 Vector4f VR::get_current_offset() {
     if (!is_hmd_active()) {
         return Vector4f{};
@@ -2443,7 +2953,7 @@ Vector4f VR::get_current_offset() {
 
     std::shared_lock _{ get_runtime()->eyes_mtx };
 
-    const auto count = is_using_multipass() ? m_multipass.pass : m_frame_count;
+    const auto count = get_eye_pass_index();
 
     if (count % 2 == m_left_eye_interval) {
         //return Vector4f{m_eye_distance * -1.0f, 0.0f, 0.0f, 0.0f};
@@ -2461,7 +2971,7 @@ Matrix4x4f VR::get_current_eye_transform(bool flip) {
 
     std::shared_lock _{get_runtime()->eyes_mtx};
 
-    const auto count = is_using_multipass() ? m_multipass.pass : m_frame_count;
+    const auto count = get_eye_pass_index();
     const auto mod_count = flip ? m_right_eye_interval : m_left_eye_interval;
 
     if (count % 2 == mod_count) {
@@ -2478,7 +2988,7 @@ Matrix4x4f VR::get_current_projection_matrix(bool flip) {
 
     std::shared_lock _{get_runtime()->eyes_mtx};
 
-    const auto count = is_using_multipass() ? m_multipass.pass : m_frame_count;
+    const auto count = get_eye_pass_index();
     const auto mod_count = flip ? m_right_eye_interval : m_left_eye_interval;
 
     if (count % 2 == mod_count) {
@@ -2523,13 +3033,50 @@ void VR::on_pre_imgui_frame() {
         return;
     }
 
+    // Flatscreen 3D: no VR overlay; the framework menu draws to the backbuffer.
+    if (is_using_flat3d()) {
+        return;
+    }
+
     m_overlay_component.on_pre_imgui_frame();
 }
 
 void VR::on_present() {
     REF_PROFILE_FUNCTION();
 
-    if (is_using_multipass() || (m_render_frame_count + 1) % 2 == m_left_eye_interval) {
+    // General flat3d present heartbeat (any technique) so an external monitor can tell healthy
+    // rendering (heartbeat keeps growing) from a real freeze/device-removal (heartbeat stops).
+    if (is_using_flat3d()) {
+        static uint32_t s_fhb = 0;
+        if ((s_fhb++ % 120) == 0) { spdlog::info("[Flat3D] present HEARTBEAT #{}", s_fhb - 1); }
+    }
+
+
+    // Flat3D true-sequential: with delay-render disabled the engine's EndRendering runs
+    // synchronously, so the RE-RUN's EndRendering triggers an EXTRA swapchain present per frame
+    // (inside_on_end). Two real presents per frame cycle the swapchain buffers twice, which
+    // corrupts the per-backbuffer command-context/fence assumptions in D3D12Component::on_frame
+    // and deadlocks. Fully suppress the re-run's present: skip our compose AND tell the D3D12
+    // hook to skip the actual swapchain flip - only the real frame present composes+flips (both
+    // eyes are already harvested by then).
+    if (is_using_flat3d_true_sequential() && inside_on_end) {
+        if (g_framework->is_dx12()) {
+            if (auto& hook = g_framework->get_d3d12_hook(); hook != nullptr) {
+                hook->ignore_next_present();
+            }
+        }
+
+        return;
+    }
+
+    // UI extraction: the engine drew the UI into our clone (RENDER_TARGET) during this frame's
+    // EndRendering (before this present). Transition it back to COMMON so next frame's
+    // COMMON->RENDER_TARGET barrier is valid. (When we wire the compose read, this becomes
+    // RENDER_TARGET->PIXEL_SHADER_RESOURCE instead, read in on_frame, then ->COMMON.)
+    if (false) { // flat3d UI-extraction experiment removed
+    }
+
+    if (is_using_multipass() || is_using_flat3d_true_sequential() || (m_render_frame_count + 1) % 2 == m_left_eye_interval) {
         ResetEvent(m_present_finished_event);
     }
 
@@ -2617,7 +3164,7 @@ void VR::on_present() {
         m_submitted = false;
     }
 
-    if (is_using_multipass() || (m_render_frame_count + 1) % 2 == m_left_eye_interval) {
+    if (is_using_multipass() || is_using_flat3d_true_sequential() || (m_render_frame_count + 1) % 2 == m_left_eye_interval) {
         SetEvent(m_present_finished_event);
     }
 }
@@ -2693,6 +3240,12 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
     inside_gui_draw = true;
 
     if (!get_runtime()->ready()) {
+        return true;
+    }
+
+    // Flatscreen 3D: GUI stays game-controlled - GUI depth is handled at compose time by the
+    // overlay-RT redirect (the world-space GUI experiment is retired).
+    if (is_using_flat3d()) {
         return true;
     }
 
@@ -2808,7 +3361,10 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
                 static auto ui_world_pos_attach_typedef = sdk::find_type_definition("app.UIWorldPosAttach");
 
                 auto ui_scale = m_ui_scale_option->value();
-                const auto world_ui_scale = m_world_ui_scale_option->value();
+                auto world_ui_scale = m_world_ui_scale_option->value();
+
+                // (Flat3D analytic auto-sizing removed - flat3d early-returns above; GUI depth is
+                // handled at compose time by the overlay-RT redirect.)
 
                 auto& restore_data = g_elements_to_reset.emplace_back(std::make_unique<GUIRestoreData>());
                 auto original_game_object_pos = sdk::get_transform_position(game_object->get_transform());
@@ -3055,9 +3611,12 @@ bool VR::on_pre_gui_draw_element(REComponent* gui_element, void* primitive_conte
                         gui_matrix[3] = camera_position + (wanted_rotation_mat[2] * ui_distance) + (wanted_rotation_mat[0] * right_world_adjust);
                         gui_matrix[3].w = 1.0f;
 
-                        // Scales the GUI so it's not massive.
+                        // Scales the GUI so it's not massive. Dynamic sizing: scale grows
+                        // proportionally with the plane distance, so the APPARENT size stays
+                        // constant as the depth slider pushes the GUI away (anchored at d=1,
+                        // where the flat3d auto-fit was calibrated; HMD default d=1 unchanged).
                         if (!wants_face_glue) {
-                            const auto scale = 1.0f / ui_scale;
+                            const auto scale = std::max(ui_distance, 0.05f) / ui_scale;
                             gui_matrix = glm::scale(gui_matrix, Vector3f{ scale, scale, scale });
                         }
 
@@ -3355,11 +3914,15 @@ void VR::on_pre_begin_rendering(void* entry) {
     }
     
     // Call WaitGetPoses
-    if (is_using_multipass() || (!inside_on_end && m_frame_count % 2 == m_left_eye_interval)) {
+    // Flat3D true-sequential renders BOTH eyes in one frame (main pass + re-run), so it must
+    // update the pose/camera every frame like multipass - never gate to even frames (which
+    // would leave odd frames rendering a stale camera and, via the present-event pacing below,
+    // stall to ~3fps).
+    if (is_using_multipass() || (is_using_flat3d_true_sequential() && !inside_on_end) || (!inside_on_end && m_frame_count % 2 == m_left_eye_interval)) {
         update_hmd_state();
     }
 
-    const auto should_update_camera = (m_frame_count % 2 == m_left_eye_interval) || is_using_afr() || is_using_multipass();
+    const auto should_update_camera = (m_frame_count % 2 == m_left_eye_interval) || is_using_afr() || is_using_multipass() || is_using_flat3d_true_sequential();
 
     if (!inside_on_end && should_update_camera) {
         update_camera();
@@ -3398,6 +3961,9 @@ void VR::on_pre_end_rendering(void* entry) {
 
 void VR::on_end_rendering(void* entry) {
     REF_PROFILE_FUNCTION();
+
+    if (is_using_flat3d_true_sequential()) {
+    }
 
     // we set this because we've enabled asynchronous rendering
     // by the time the next frame (right eye) starts,
@@ -3486,17 +4052,36 @@ void VR::on_end_rendering(void* entry) {
             if (g_framework->is_dx12()) {
                 bool force_reset = false;
 
+                // Multipass harvest (VR and Flat3D both): allocate the per-eye native_res_copies
+                // clones once (via create_texture). Each eye's prepared color is copied into
+                // them in-stream by on_prepare_output_layer_draw (context->copy_texture); the
+                // eye_texture population below points at the clones' native resources, which
+                // D3D12Component reads at present (Flat3D converts HDR -> 8-bit per eye).
+                //
                 if (m_multipass.allocated_size[0] != get_hmd_width() || m_multipass.allocated_size[1] != get_hmd_height()) {
                     const auto rtv0 = output_states[0]->get_rtv(0);
                     const auto rtv1 = output_states[1]->get_rtv(0);
 
                     if (rtv0 != nullptr && rtv1 != nullptr) {
+                        // Flat3D clones the OUTPUT target (fmt 24) - the copy sources the overlay's
+                        // main target (the same shared output resource, populated at the pre-overlay
+                        // hook). The scene intermediates (PostMainTarget) are recycled/black at every
+                        // hook we can reach, so we harvest the final composited output instead.
                         const auto tex0 = rtv0->get_texture_d3d12();
                         const auto tex1 = rtv1->get_texture_d3d12();
 
                         if (tex0 != nullptr && tex1 != nullptr) {
                             m_multipass.native_res_copies[0] = tex0->clone();
                             m_multipass.native_res_copies[1] = tex1->clone();
+
+                            // Flat3D (Wilds): the engine copy_texture into a create_texture clone
+                            // crashes because the clone's per-subresource state tracker doesn't
+                            // match the copy's desired COPY_DEST state, so the executor tries to
+                            // record a transition against an unregistered resource (find() walks
+                            // off the end). Prime the tracker to COPY_DEST (0x400) so the copy's
+                            // dst-resolve takes the no-transition fast path - no registry, no
+                            // crash. (See prime_copy_dest_state; verified from executor find() at
+                            // exe+0xab4e222 which passes desired=0x400 for the copy dst.)
 
                             m_multipass.allocated_size[0] = get_hmd_width();
                             m_multipass.allocated_size[1] = get_hmd_height();
@@ -3523,8 +4108,8 @@ void VR::on_end_rendering(void* entry) {
                         }
                     }
                 }
-                
-                if (m_multipass.native_res_copies[1] != nullptr) {
+
+                if (!is_using_flat3d() && m_multipass.native_res_copies[1] != nullptr) {
                     const auto container = m_multipass.native_res_copies[1]->get_d3d12_resource_container();
 
                     if (container != nullptr) {
@@ -3547,12 +4132,14 @@ void VR::on_end_rendering(void* entry) {
         return;
     }
 
-    // Only render again on even (left eye) frames
-    // We're checking == 1 because at this point, the frame has finished.
-    // Meaning the previous frame was a left eye frame.
-    if (!inside_on_end && m_render_frame_count % 2 == m_left_eye_interval) {
+    // VR sequential re-runs only on even (left) frames (perf: half the re-render cost, at the price
+    // of a 1-frame eye stagger). Flat3D TRUE-sequential re-runs EVERY frame so BOTH eyes render at
+    // the same tick from the real camera - no stagger, and the second eye gets the full VFX/lighting
+    // render the multipass clone can't. Costs a full 2x scene render per frame.
+    if (!inside_on_end && (is_using_flat3d_true_sequential() || m_render_frame_count % 2 == m_left_eye_interval)) {
         inside_on_end = true;
-        
+
+
         // Try to render again for the right eye
         auto app = sdk::Application::get();
 
@@ -3635,8 +4222,6 @@ void VR::on_end_rendering(void* entry) {
         }
 
         for (auto func : chain) {
-            //spdlog::info("Calling {}", func->description);
-
             func->func(func->entry);
         }
 
@@ -3664,6 +4249,15 @@ void VR::on_wait_rendering(void* entry) {
     }
 
     if (is_using_multipass()) {
+        return;
+    }
+
+    // Flat3D true-sequential renders BOTH eyes synchronously within one frame (main pass +
+    // engine re-run). With the engine's delay-render disabled, rendering is already fully
+    // serialized, so the present-event throttle is redundant AND harmful here: it injects an
+    // uneven per-frame stall (frame N waits on frame N-1's present) that reads as stutter and
+    // jerky parallax ("squish") during camera motion. Skip it - delay-render-off paces us.
+    if (is_using_flat3d_true_sequential()) {
         return;
     }
 
@@ -3731,7 +4325,11 @@ void VR::on_application_entry(void* entry, const char* name, size_t hash) {
 }
 
 void VR::on_pre_update_hid(void* entry) {
-    if (!get_runtime()->loaded || !is_hmd_active()) {
+    // Flatscreen 3D is display-only: no motion controllers, input stays
+    // game-controlled. Never inject VR input (there is no runtime behind it -
+    // driving the RE Engine input reflection here with no controller state
+    // walks a degenerate object and recurses until the stack overflows).
+    if (!get_runtime()->loaded || !is_hmd_active() || is_using_flat3d()) {
         return;
     }
 
@@ -3739,7 +4337,7 @@ void VR::on_pre_update_hid(void* entry) {
 }
 
 void VR::on_update_hid(void* entry) {
-    if (!get_runtime()->loaded || !is_hmd_active()) {
+    if (!get_runtime()->loaded || !is_hmd_active() || is_using_flat3d()) {
         return;
     }
 
@@ -4187,6 +4785,11 @@ void VR::on_draw_ui() {
     ImGui::TextWrapped("VR Runtime: %s", get_runtime()->name().data());
     ImGui::TextWrapped("Render Resolution: %d x %d", get_runtime()->get_width(), get_runtime()->get_height());
 
+    if (get_runtime()->is_flat3d()) {
+        draw_flat3d_ui();
+        return;
+    }
+
     if (get_runtime()->is_openvr()) {
         ImGui::TextWrapped("Resolution can be changed in SteamVR");
     } else if (get_runtime()->is_openxr()) {
@@ -4295,11 +4898,176 @@ void VR::on_draw_ui() {
     ImGui::DragFloat("Avg Input Processing Delay (MS)", &duration_float, 0.00001f);
 }
 
+void VR::draw_flat3d_ui() {
+    ImGui::Separator();
+    ImGui::Text("Flatscreen 3D");
+
+    m_flat3d_output_mode->draw("Output Mode");
+
+    // Pixel-exactness warning: interlaced/checkerboard/LeiaSR need the backbuffer 1:1 on the panel.
+    if (m_flat3d_native_mismatch.load()) {
+        const auto mode = (Flat3DOutputMode)m_flat3d_output_mode->value();
+        if (mode == FLAT3D_ROW_INTERLACED || mode == FLAT3D_COLUMN_INTERLACED
+                || mode == FLAT3D_CHECKERBOARD || mode == FLAT3D_LEIA_SR) {
+            ImGui::TextColored(ImVec4{1.0f, 0.8f, 0.1f, 1.0f},
+                "Warning: output is not display-native - this mode's pixel pattern will be rescaled\n"
+                "and broken. Set the game resolution to the desktop resolution (use DLSS render\n"
+                "scaling for performance instead).");
+        }
+    }
+
+    const auto mode = m_flat3d_output_mode->value();
+
+    if (mode == FLAT3D_ROW_INTERLACED || mode == FLAT3D_COLUMN_INTERLACED || mode == FLAT3D_CHECKERBOARD) {
+        // Interlaced/checkerboard patterns must be display-pixel-exact: warn
+        // when the backbuffer is not the same size as the display showing it.
+        static std::chrono::steady_clock::time_point s_last_check{};
+        static bool s_display_native = true;
+
+        const auto now = std::chrono::steady_clock::now();
+
+        if (now - s_last_check >= std::chrono::seconds(2)) {
+            s_last_check = now;
+
+            IDXGISwapChain* swapchain = nullptr;
+
+            if (g_framework->is_dx12()) {
+                if (auto& hook = g_framework->get_d3d12_hook(); hook != nullptr) {
+                    swapchain = hook->get_swap_chain();
+                }
+            } else {
+                if (auto& hook = g_framework->get_d3d11_hook(); hook != nullptr) {
+                    swapchain = hook->get_swap_chain();
+                }
+            }
+
+            if (swapchain != nullptr) {
+                DXGI_SWAP_CHAIN_DESC desc{};
+                ComPtr<IDXGIOutput> output{};
+
+                if (SUCCEEDED(swapchain->GetDesc(&desc)) && SUCCEEDED(swapchain->GetContainingOutput(&output))) {
+                    DXGI_OUTPUT_DESC out_desc{};
+
+                    if (SUCCEEDED(output->GetDesc(&out_desc))) {
+                        const auto out_w = (uint32_t)(out_desc.DesktopCoordinates.right - out_desc.DesktopCoordinates.left);
+                        const auto out_h = (uint32_t)(out_desc.DesktopCoordinates.bottom - out_desc.DesktopCoordinates.top);
+                        s_display_native = desc.BufferDesc.Width == out_w && desc.BufferDesc.Height == out_h;
+                    }
+                }
+            }
+        }
+
+        if (!s_display_native) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.0f, 0.0f, 1.0f));
+            ImGui::TextWrapped("WARNING: the game window is not display-native. Interlaced/checkerboard patterns will not line up with the panel; use borderless fullscreen at the display's native resolution.");
+            ImGui::PopStyleColor();
+        }
+    }
+
+    m_flat3d_eye_swap->draw("Swap Eyes");
+    m_flat3d_depth->draw("Depth (Separation)");
+    m_flat3d_convergence->draw("Convergence");
+    m_flat3d_reference_fov->draw("Reference FOV");
+
+    // Live game FOV readout (recorded from the projection hook; vfov = 2*atan(1/P11)).
+    {
+        const auto p00 = m_flat3d_game_p00.load();
+        const auto p11 = m_flat3d_game_p11.load();
+
+        if (p00 > 0.0f && p11 > 0.0f) {
+            const auto vfov = glm::degrees(2.0f * std::atan(1.0f / p11));
+            const auto hfov = glm::degrees(2.0f * std::atan(1.0f / p00));
+            ImGui::TextDisabled("Game FOV now: %.1f deg vertical / %.1f deg horizontal", vfov, hfov);
+        } else {
+            ImGui::TextDisabled("Game FOV now: (no projection recorded yet)");
+        }
+    }
+
+    m_flat3d_crop_eyes_169->draw("Crop Eyes to 16:9 (SbS/TaB)");
+
+    ImGui::TextDisabled("AFW plugin: %s", m_flat3d_afw.status());
+    m_flat3d_afw_enabled->draw("AFW: warp missing AFR eye (needs AFR technique + plugin)");
+    if (m_flat3d_afw_enabled->value() && m_flat3d_afw.is_available()) {
+        m_flat3d_afw_mode->draw("  AFW: warp mode (halo/noise A/B)");
+        m_flat3d_afw_depth_dilation->draw("  AFW: depth edge dilation px (silhouette halo fix; 0 = off)");
+        m_flat3d_afw_obj_motion->draw("  AFW: warp object motion (movers anti-stutter; 0 = off)");
+        if (m_flat3d_afw_obj_motion->value() > 0.0f) {
+            m_flat3d_afw_motion_thresh->draw("  AFW: motion threshold px (foliage gate for object motion)");
+        }
+        m_flat3d_afw_debug->draw("  AFW: debug logging (MV bursts, readbacks)");
+        m_flat3d_afw_plugin_debug->draw("  AFW: plugin debug view (changes rendering)");
+    }
+
+    m_ui_distance_option->draw("GUI depth (m)");
+
+    if (ImGui::TreeNode("Auto-Convergence & Crosshair")) {
+        m_flat3d_auto_convergence->draw("Auto-Convergence");
+        m_flat3d_max_popout->draw("Max Pop-out (% of width)");
+        m_flat3d_autoconv_smoothing->draw("Auto-Convergence Smoothing");
+        m_flat3d_dynamic_crosshair->draw("Dynamic Crosshair");
+        m_flat3d_crosshair_depth->draw("Crosshair Fallback Depth (m)");
+        m_flat3d_swap_shift_sign->draw("Swap Crosshair Shift Sign");
+
+        const auto nearest = m_flat3d_depth_sampler.get_nearest_depth();
+        const auto center = m_flat3d_depth_sampler.get_center_depth();
+
+        if (nearest > 0.0f || center > 0.0f) {
+            ImGui::Text("Depth samples: nearest %.2f m, center %.2f m", nearest, center);
+            ImGui::Text("Applied: convergence %.3f m, separation %.4f m", m_flat3d->convergence, m_flat3d->separation_eff);
+        } else if (m_flat3d_auto_convergence->value() || m_flat3d_dynamic_crosshair->value()) {
+            ImGui::TextWrapped("No depth samples yet (depth buffer not located or readback pending).");
+        }
+
+        ImGui::TreePop();
+    }
+
+    ImGui::Separator();
+
+    m_rendering_technique->draw("Rendering Technique");
+    m_use_custom_view_distance->draw("Use Custom View Distance");
+    m_view_distance->draw("View Distance/FarZ");
+
+    ImGui::Separator();
+    ImGui::Text("Graphical Options");
+
+    m_force_fps_settings->draw("Force Uncap FPS");
+    m_force_aa_settings->draw("Force Disable TAA");
+    m_force_motionblur_settings->draw("Force Disable Motion Blur");
+    m_force_vsync_settings->draw("Force Disable V-Sync");
+    m_force_lensdistortion_settings->draw("Force Disable Lens Distortion");
+    m_force_volumetrics_settings->draw("Force Disable Volumetrics");
+    m_force_lensflares_settings->draw("Force Disable Lens Flares");
+    m_force_dynamic_shadows_settings->draw("Force Enable Dynamic Shadows");
+    m_enable_asynchronous_rendering->draw("Enable Asynchronous Rendering");
+
+    ImGui::Separator();
+    ImGui::Text("Debug info");
+    m_camera_duplicator.on_draw_ui();
+
+    m_flat3d_swap_shear_sign->draw("Swap Shear Sign (use if 3D is inverted)");
+    ImGui::Checkbox("Disable Projection Matrix Override", &m_disable_projection_matrix_override);
+    ImGui::Checkbox("Disable GUI Projection Matrix Override", &m_disable_gui_camera_projection_matrix_override);
+    ImGui::Checkbox("Disable View Matrix Override", &m_disable_view_matrix_override);
+    ImGui::Checkbox("Disable Temporal Fix", &m_disable_temporal_fix);
+    ImGui::Checkbox("Disable Post Effect Fix", &m_disable_post_effect_fix);
+}
+
 void VR::on_device_reset() {
     std::scoped_lock _{m_openxr->sync_mtx};
 
     m_multipass.eye_textures[0] = nullptr;
     m_multipass.eye_textures[1] = nullptr;
+
+    // Drop the flat3d redirect resources so they get re-cloned at the new
+    // resolution/format (they're sized from the engine's real output target).
+    m_multipass.flat3d_output_clones[0] = nullptr;
+    m_multipass.flat3d_output_clones[1] = nullptr;
+    m_multipass.flat3d_eye_rtvs[0] = nullptr;
+    m_multipass.flat3d_eye_rtvs[1] = nullptr;
+    m_multipass.flat3d_eye_textures[0] = nullptr;
+    m_multipass.flat3d_eye_textures[1] = nullptr;
+
+    m_flat3d_depth_sampler.reset();
 
     spdlog::info("VR: on_device_reset");
     m_backbuffer_inconsistency = false;
@@ -4332,6 +5100,10 @@ void VR::on_device_reset() {
 void VR::on_config_load(const utility::Config& cfg) {
     for (IModValue& option : m_options) {
         option.config_load(cfg);
+    }
+
+    if (m_flat3d != nullptr) {
+        m_flat3d->enabled = true; // stereo always active (the Active toggle is retired)
     }
 
     // Run the rest of OpenXR initialization code here that depends on config values

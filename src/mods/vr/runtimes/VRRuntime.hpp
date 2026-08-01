@@ -22,6 +22,7 @@ struct VRRuntime {
         NONE,
         OPENXR,
         OPENVR,
+        FLAT3D, // Flatscreen stereo 3D, no HMD
     };
 
     enum class Eye : uint8_t {
@@ -108,6 +109,10 @@ struct VRRuntime {
 
     bool is_openvr() const {
         return this->type() == Type::OPENVR;
+    }
+
+    bool is_flat3d() const {
+        return this->type() == Type::FLAT3D;
     }
 
     bool loaded{false};

@@ -101,8 +101,13 @@ private:
         WantedComponent{ "via.render.MotionBlur", { } },
         WantedComponent{ "via.render.FakeLensflare", { } },
         WantedComponent{ "via.render.RetroFilm", { } },
+        // Flat3D per-eye color divergence: these are on the MHWilds camera but were NOT property-copied
+        // to the clone, so the 2nd eye used default grade/color -> warm(left)/blue(right) divergence.
+        // CustomFilter is the game's color-grade/LUT filter; copy it (and its transparent-pass variant)
+        // so the clone matches. (Was previously commented out.)
+        WantedComponent{ "via.render.CustomFilter", { } },
+        WantedComponent{ "via.render.CustomFilterBeforeTransparent", { } },
         //WantedComponent{ "via.render.ExperimentalRayTrace", {}}
-        //WantedComponent{ "via.render.CustomFilter", { } },
     };
 
     std::vector<std::function<void()>> m_property_jobs{};

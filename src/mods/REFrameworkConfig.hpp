@@ -40,7 +40,7 @@ private:
     ModToggle::Ptr m_always_show_cursor{ ModToggle::create(generate_name("DrawCursorWithMenuOpen"), false) };
 #endif
     ModKey::Ptr m_show_cursor_key{ ModKey::create(generate_name("ShowCursorKey")) };
-    ModInt32::Ptr m_font_size{ModInt32::create(generate_name("FontSize"), 16)};
+    ModInt32::Ptr m_font_size{ModInt32::create(generate_name("FontSize"), 24)};
     std::vector<std::string> fonts{};
     ModComboString::Ptr m_font_file{};
 

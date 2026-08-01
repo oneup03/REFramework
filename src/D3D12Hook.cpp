@@ -732,6 +732,31 @@ HRESULT WINAPI D3D12Hook::resize_buffers(IDXGISwapChain3* swap_chain, UINT buffe
 
     auto resize_buffers_fn = d3d12->m_swapchain_hook->get_method<decltype(D3D12Hook::resize_buffers)*>(13);
 
+    // Flat3D native-output override: remember the engine's requested size, then substitute the
+    // containing display's physical resolution (DXGI desktop coords = physical pixels) so
+    // interlaced/checkerboard/LeiaSR patterns map 1:1 to the panel. The flat3d compose samples
+    // the believed sub-region.
+    d3d12->m_engine_believed_width = width;
+    d3d12->m_engine_believed_height = height;
+
+    if (s_force_native_resolution.load() && width != 0 && height != 0) {
+        IDXGIOutput* dxgi_output{nullptr};
+        if (SUCCEEDED(swap_chain->GetContainingOutput(&dxgi_output)) && dxgi_output != nullptr) {
+            DXGI_OUTPUT_DESC od{};
+            if (SUCCEEDED(dxgi_output->GetDesc(&od))) {
+                const auto ow = (UINT)(od.DesktopCoordinates.right - od.DesktopCoordinates.left);
+                const auto oh = (UINT)(od.DesktopCoordinates.bottom - od.DesktopCoordinates.top);
+
+                if (ow > width && oh > height) {
+                    spdlog::info("[Flat3D] Forcing native swapchain {}x{} (engine asked {}x{})", ow, oh, width, height);
+                    width = ow;
+                    height = oh;
+                }
+            }
+            dxgi_output->Release();
+        }
+    }
+
     d3d12->m_display_width = width;
     d3d12->m_display_height = height;
 

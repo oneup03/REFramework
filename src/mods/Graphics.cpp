@@ -753,7 +753,8 @@ void Graphics::do_ultrawide_fix() {
     }
 
     // No need to perform ultrawide fix if VR is running.
-    if (VR::get()->is_hmd_active()) {
+    // Flatscreen 3D keeps the game's own FoV, so the fix stays compatible there.
+    if (VR::get()->is_hmd_active() && !VR::get()->is_using_flat3d()) {
         return;
     }
 
@@ -832,7 +833,8 @@ void Graphics::do_ultrawide_fov_restore(bool force) {
     }
 
     // No need to perform ultrawide fix if VR is running.
-    if (VR::get()->is_hmd_active()) {
+    // Flatscreen 3D keeps the game's own FoV, so the fix stays compatible there.
+    if (VR::get()->is_hmd_active() && !VR::get()->is_using_flat3d()) {
         return;
     }
 

@@ -95,6 +95,12 @@ private:
     template <typename T> using ComPtr = Microsoft::WRL::ComPtr<T>;
 
     bool on_first_frame();
+    // Query the plugin for available upscale methods and populate the method
+    // lists. Returns true if at least one is available. Safe to call more than
+    // once (clears first) - used both at on_initialize (pre-device) and again in
+    // on_first_frame after SetupDirectX, since some backends can't report
+    // availability until they've been handed the D3D device.
+    bool enumerate_upscale_methods();
     bool init_upscale_features();
     void release_upscale_features();
     void fix_output_layer();

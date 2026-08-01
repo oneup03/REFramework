@@ -854,7 +854,7 @@ void RenderContext::copy_texture(Texture* dest, Texture* src, Fence& fence) {
 #endif
 
 #if defined(REFRAMEWORK_UNIVERSAL) || TDB_VER >= 82
-    auto copy_modern = [&]() {
+    auto copy_modern = [&]() -> bool {
         using CopyTexFn = void (*)(RenderContext*, Texture*, int32_t, Texture*, int32_t, Fence&);
         static auto func = []() -> CopyTexFn {
             spdlog::info("Searching for RenderContext::copy_texture (>= TDB82)");
@@ -883,14 +883,114 @@ void RenderContext::copy_texture(Texture* dest, Texture* src, Fence& fence) {
         if (func != nullptr) {
             // src, src_subresource, dst, dst_subresource, fence
             func(this, src, -1, dest, -1, fence);
+            return true;
         }
+
+        return false;
     };
 #endif
 
-    if (sdk::GameIdentity::get().tdb_ver() < 82) {
+#if defined(REFRAMEWORK_UNIVERSAL) || TDB_VER >= 73
+    // Fallback for modern engines (e.g. MHWilds, TDB 81) that don't expose a
+    // standalone copy_texture we can resolve by scan. Instead of calling the
+    // function directly we build a CopyTexture render command through the
+    // RenderContext command allocator, exactly like clear_rtv() builds a Clear.
+    //
+    // Verified by static analysis of the MHWilds executable:
+    //   * RenderContext::alloc resolves (mid-function pattern in Renderer.cpp).
+    //   * via.render.command.TypeId::CopyTexture == 1 (reflection enum registration).
+    //   * The engine's command executor dispatch table handles typeid 1 (CopyTexture)
+    //     right beside typeid 0 (Clear), so a command allocated this way is drained
+    //     and executed by the same path clear_rtv already relies on.
+    // This is the "extra garbage" path the direct-call code originally punted on:
+    // on TDB>=82 the direct scan works and is preferred; only when it fails do we
+    // fall back here.
+    auto copy_alloc = [&]() -> bool {
+        static const auto copy_texture_typeid = sdk::get_enum_value<uint32_t>("via.render.command.TypeId", "CopyTexture");
+
+        // CopyTexture is enum value 1; if reflection lookup came back 0 (not found),
+        // fall back to the known-correct constant rather than aliasing onto Clear (0).
+        const uint32_t t = copy_texture_typeid != 0 ? copy_texture_typeid : 1u;
+
+        auto new_command = (command::CopyTexture*)alloc(t, sizeof(command::CopyTexture));
+
+        if (new_command == nullptr) {
+            return false;
+        }
+
+        const auto protect_frame = get_protect_frame();
+
+        if (dest->m_render_frame != protect_frame) {
+            dest->m_render_frame = protect_frame;
+        }
+
+        if (src->m_render_frame != protect_frame) {
+            src->m_render_frame = protect_frame;
+        }
+
+        new_command->src = (sdk::renderer::RenderResource*)src;
+        new_command->dst = (sdk::renderer::RenderResource*)dest;
+        new_command->fence = fence;
+        new_command->src_subresource = -1;
+        new_command->dst_subresource = -1;
+
+        // MHWilds: the real CopyTexture command is 0x30 bytes laid out as
+        //   [0x10]=src  [0x18]=dst  [0x20]={sync token}  [0x28]=src_subres  [0x2c]=dst_subres
+        // There is NO Fence member - the SDK's CopyBase model (fence at 0x20-0x2f, subres at
+        // 0x30/0x34) is wrong for Wilds. copy_alloc's `new_command->fence = fence` therefore
+        // writes garbage over BOTH the sync token (0x20) and the subresource slots (0x28/0x2c).
+        // Fix them to what the engine's own builder writes:
+        //   * sync token [0x20] = {id:-2 "immediate/no-fence", val:0} - anything else here makes
+        //     the executor defer or drop the copy (destination stays BLACK).
+        //   * subresources [0x28]/[0x2c] = 0 (single-subresource; matches the primed tracker).
+        *(uint64_t*)((uintptr_t)new_command + 0x20) = 0x00000000fffffffeull;
+        *(int32_t*)((uintptr_t)new_command + 0x28) = 0;
+        *(int32_t*)((uintptr_t)new_command + 0x2c) = 0;
+
+        return true;
+    };
+
+    // MHWilds: call the engine's OWN CopyTexture command builder instead of hand-assembling the
+    // command (copy_alloc did that and produced a no-op/black copy). The builder writes the exact
+    // 0x30-byte layout the executor expects. Signature (verified from its 58 call sites):
+    //   f(RenderContext* ctx /*rcx*/, RenderResource* dst /*rdx*/, RenderResource* src /*r8*/,
+    //     Tracking* /*r9*/) where Tracking = { int32 id; int32 val; int64 subresource_bitmap };
+    // id = -2 ("immediate / no fence"), val = 0, bitmap = 0 (no per-subresource marking).
+    auto copy_engine = [&]() -> bool {
+        using CopyEngineFn = void (*)(void*, void*, void*, void*);
+        static auto fn = []() -> CopyEngineFn {
+            const auto game = utility::get_executable();
+            const auto match = utility::scan(game,
+                "41 56 56 57 53 48 83 EC 28 4C 89 CE 4C 89 C3 48 89 D7 49 89 CE BA 01 00 00 00 41 B8 30 00 00 00 E8");
+
+            if (!match) {
+                spdlog::error("Failed to find engine copy_texture builder");
+                return nullptr;
+            }
+
+            spdlog::info("Found engine copy_texture builder: {:x}", *match);
+            return (CopyEngineFn)*match;
+        }();
+
+        if (fn == nullptr) {
+            return false;
+        }
+
+        struct Tracking { int32_t id; int32_t val; uint64_t bitmap; } tracking{ -2, 0, 0 };
+        fn(this, (void*)dest, (void*)src, &tracking);
+        return true;
+    };
+#endif
+
+    // MHWilds (TDB 81) is "82-like" (it carries the same tdb82_padding proven by
+    // the RenderResource offset dump). Its copy_texture is not a resolvable
+    // standalone function (the "CopyImage" string is gone and the >=82 byte pattern
+    // doesn't match), so call the engine's command builder directly. TDB>=82 titles
+    // (DD2/RE4) keep using the working direct-call scan.
+    if (sdk::GameIdentity::get().tdb_ver() < 81) {
         copy_legacy();
-    } else {
-        copy_modern();
+    } else if (!copy_engine() && !copy_modern()) {
+        copy_alloc();
     }
 //#endif
 }
@@ -1336,6 +1436,14 @@ TargetState* create_target_state(TargetState::Desc* desc) {
         return nullptr;
     }();
 
+    // Guard: on games where the scan fails (e.g. MHWilds, where the
+    // "CircularDOF_SceneMipTexture" anchor string is absent) fn is null; calling it
+    // would jump to address 0 (RIP=0 crash). Fail gracefully so callers like
+    // TargetState::clone() return null instead of crashing.
+    if (fn == nullptr) {
+        return nullptr;
+    }
+
     return fn(nullptr, desc);
 }
 
@@ -1356,8 +1464,48 @@ TargetState* create_target_state(TargetState::Desc* desc) {
 + 0xD9 systems/shader/speedTree/speedTree.sdf
 - 0x18 width=%u,height=%u,depth=%u,mip=%u,array=%u,format=%u,usage=%u,bind=%u
 */
+// The MHWilds texture factory takes the render device as arg1 (rdx) - NOT the RTV-pool
+// device (that's a separate object; see resolve_rtv_pool_device). It's the memory/heap
+// device at singleton->[0x18], where the singleton pointer lives at a global resolved from
+// its init site (mov ecx,0x45950; call alloc; mov [global],rax). This is exactly the device
+// the engine's own create_texture wrapper passes.
+static void* resolve_texture_memory_device() {
+    static void** const singleton_global = []() -> void** {
+        const auto game = utility::get_executable();
+        const auto match = utility::scan(game, "B9 50 59 04 00 E8 ? ? ? ? 48 89 05 ? ? ? ?");
+
+        if (!match) {
+            return nullptr;
+        }
+
+        return (void**)utility::calculate_absolute(*match + 13);
+    }();
+
+    if (singleton_global == nullptr || *singleton_global == nullptr) {
+        return nullptr;
+    }
+
+    return *(void**)((uintptr_t)*singleton_global + 0x18);
+}
+
+// The MHWilds texture factory (the fn that CONTAINS the "width=%u,..." debug name) uses a
+// 4-arg output-struct convention instead of the 2-arg (device, desc) shape the string
+// walk-back resolves on other RE games:
+//   factory(void* out /*rcx*/, void* device /*rdx*/, Texture::Desc* desc /*r8*/, uint32_t dim /*r9d*/)
+//   out layout: { bool ok @0; Texture* tex @8; void* aux @0x10; }  (also returned in rax)
+//   dim = (desc->arr >= 2) ? 5 : 4   (Texture2DArray vs Texture2D)
+using create_texture_wilds_fn = void* (*)(void* /*out*/, void* /*device*/, Texture::Desc* /*desc*/, uint32_t /*dim*/);
+
 Texture* create_texture(Texture::Desc* desc) {
-    static auto fn = []() -> Texture* (*)(void*, Texture::Desc*) {
+    // Exactly one of these is non-null after resolution. The Wilds path needs its own call
+    // adapter (output struct + explicit device + dimension), so it can't share the 2-arg
+    // signature.
+    struct Resolved {
+        Texture* (*two_arg)(void*, Texture::Desc*) = nullptr;
+        create_texture_wilds_fn wilds = nullptr;
+    };
+
+    static const Resolved resolved = []() -> Resolved {
         spdlog::info("Searching for create_texture");
 
         const auto game = utility::get_executable();
@@ -1365,33 +1513,53 @@ Texture* create_texture(Texture::Desc* desc) {
 
         if (!string) {
             spdlog::error("Failed to find create_texture (no string)");
-            return nullptr;
+            return {};
         }
 
         const auto string_ref = utility::scan_displacement_reference(game, *string);
 
         if (!string_ref) {
             spdlog::error("Failed to find create_texture (no string ref)");
-            return nullptr;
+            return {};
         }
 
+        // Wilds (TDB 81): the width=%u string is the factory's own debug NAME (used INSIDE the
+        // factory, not at a call site), so the classic walk-back for a nearby CALL fails. The
+        // factory is simply the function that contains the string ref, called with the 4-arg
+        // convention above.
+        if (sdk::GameIdentity::get().is_mhwilds()) {
+            const auto fn_start = utility::find_function_start_unwind(*string_ref);
+
+            if (!fn_start) {
+                spdlog::error("Failed to find create_texture (Wilds: no function start)");
+                return {};
+            }
+
+            Resolved out{};
+            out.wilds = (create_texture_wilds_fn)*fn_start;
+            spdlog::info("Found create_texture (Wilds 4-arg factory): {:x}", *fn_start);
+            return out;
+        }
+
+        // Classic path: the string sits at a log call INSIDE a wrapper that CALLs the 2-arg
+        // factory - walk back <=20 instrs to the nearest E8.
         uintptr_t ip = *string_ref;
 
         for (auto i = 0; i < 20; ++i) {
-            const auto resolved = utility::resolve_instruction(ip);
+            const auto ins = utility::resolve_instruction(ip);
 
-            if (!resolved) {
+            if (!ins) {
                 spdlog::error("Failed to find create_texture (could not resolve instruction)");
-                return nullptr;
+                return {};
             }
 
-            ip = resolved->addr;
+            ip = ins->addr;
 
             if (*(uint8_t*)ip == 0xE8) {
-                const auto result = (Texture* (*)(void*, Texture::Desc*))utility::calculate_absolute(ip + 1);
-
-                spdlog::info("Found create_texture: {:x}", (uintptr_t)result);
-                return result;
+                Resolved out{};
+                out.two_arg = (Texture* (*)(void*, Texture::Desc*))utility::calculate_absolute(ip + 1);
+                spdlog::info("Found create_texture: {:x}", (uintptr_t)out.two_arg);
+                return out;
             }
 
             ip -= 1;
@@ -1403,32 +1571,166 @@ Texture* create_texture(Texture::Desc* desc) {
 
         if (!fn_start) {
             spdlog::error("Failed to find create_texture (no fallback)");
-            return nullptr;
+            return {};
         }
 
         const auto first_call = utility::scan_mnemonic(*fn_start, 100, "CALL");
 
         if (!first_call) {
             spdlog::error("Failed to find create_texture (no first call)");
-            return nullptr;
+            return {};
         }
 
         const auto second_call = utility::scan_mnemonic(*first_call + 1, 100, "CALL");
 
         if (!second_call) {
             spdlog::error("Failed to find create_texture (no second call)");
+            return {};
+        }
+
+        Resolved out{};
+        out.two_arg = (Texture* (*)(void*, Texture::Desc*))utility::calculate_absolute(*second_call + 1);
+        spdlog::info("Found create_texture (fallback): {:x}", (uintptr_t)out.two_arg);
+        return out;
+    }();
+
+    if (desc == nullptr) {
+        return nullptr;
+    }
+
+    if (resolved.wilds != nullptr) {
+        void* const device = resolve_texture_memory_device();
+
+        if (device == nullptr) {
             return nullptr;
         }
 
-        auto result = (Texture* (*)(void*, Texture::Desc*))utility::calculate_absolute(*second_call + 1);
+        // Output-struct convention: { bool ok @0; Texture* tex @8; ... }. The factory writes
+        // a full 0x70-byte struct (up to out+0x68) - the buffer MUST be >= 0x70 or the factory
+        // smashes the stack. It moves the texture's reference into out[8], so we take the raw
+        // pointer without AddRef (net refcount 1, owned by the returned pointer - matches
+        // clone() semantics). The other out slots hold auxiliary refs we intentionally leak
+        // (clone happens ~twice per session, cached).
+        alignas(16) uint8_t out[0x80]{};
+        const uint32_t dim = (desc->arr >= 2) ? 5u : 4u;
 
-        spdlog::info("Found create_texture (fallback): {:x}", (uintptr_t)result);
+        resolved.wilds(out, device, desc, dim);
 
-        return result;
-    }();
+        Texture* const tex = (out[0] != 0) ? *(Texture**)(out + 8) : nullptr;
+
+        // One-shot ground-truth diagnostic: does the factory produce a texture with a live
+        // D3D12 resource? If native == 0 the texture object exists but has no GPU backing
+        // (wrong arg / deferred realize); if native != 0 the texture is real and any downstream
+        // fault is in the RTV link/state, not here.
+        static bool s_logged = false;
+        if (!s_logged) {
+            s_logged = true;
+            const auto container = tex != nullptr ? tex->get_d3d12_resource_container() : nullptr;
+            const auto native = container != nullptr ? container->get_native_resource() : nullptr;
+            spdlog::info("[Flat3D] create_texture(Wilds): ok={} tex={:x} container={:x} native={:x} "
+                "desc(w={} h={} d={} mip={} arr={} fmt={}) dim={} device={:x}",
+                (int)out[0], (uintptr_t)tex, (uintptr_t)container, (uintptr_t)native,
+                desc->width, desc->height, desc->depth, desc->mip, desc->arr, desc->format, dim, (uintptr_t)device);
+        }
+
+        return tex;
+    }
 
     static auto renderer = sdk::renderer::get_renderer();
-    return fn(renderer->get_device(), desc);
+
+    if (resolved.two_arg == nullptr || renderer == nullptr) {
+        return nullptr;
+    }
+
+    return resolved.two_arg(renderer->get_device(), desc);
+}
+
+void prime_copy_dest_state(Texture* tex) {
+    prime_resource_state(tex, 0x400 /* D3D12_RESOURCE_STATE_COPY_DEST */);
+}
+
+void prime_resource_state(Texture* tex, uint32_t d3d12_state, uint32_t subresource_count_override) {
+    if (tex == nullptr) {
+        return;
+    }
+
+    // ===== UPDATE-FRAGILE: hardcoded T3 engine-internal struct offsets (0x100/0x158/0x30/+0/+8). =====
+    // These are the single highest-risk values for a Wilds patch and are NOT reflection-derivable.
+    // Full re-derivation recipe + sanity checks: docs/FLAT3D_WILDS_RE.md section 2.6.
+    //
+    // The engine's command executor resolves a copy resource through a per-subresource state
+    // tracker whose base pointer lives at tex+0x100; each entry is 0x30 bytes with the current
+    // D3D12 state at +8 and the subresource index at +0x18 (verified from the executor's
+    // find() at exe+0xab509d9 / state-check at exe+0xab58289). For the copy DST the executor
+    // requests COPY_DEST (0x400); if the tracked state differs it tries to record a transition
+    // against the resource's registry entry - which a create_texture clone doesn't have - and
+    // find() walks off the end (crash). Priming the tracked state to COPY_DEST makes the resolve
+    // take the no-transition fast path, so the copy never touches the registry.
+    uint8_t* const base = *(uint8_t**)((uintptr_t)tex + 0x100);
+
+    if (base == nullptr) {
+        return;
+    }
+
+    const auto d = tex->get_desc();
+    uint32_t mips = (d != nullptr && d->mip != 0) ? d->mip : 1;
+    uint32_t arr = (d != nullptr && d->arr != 0) ? d->arr : 1;
+    uint32_t count = mips * arr;
+
+    if (count == 0 || count > 64) {
+        count = 1; // sanity clamp - our eye clones are single-mip, single-layer 2D
+    }
+
+    // Depth-stencil textures (e.g. D32S8) have TWO planes -> twice the subresources. The caller
+    // knows the plane count; without the override the stencil plane stays unprimed and the
+    // executor's registry walk crashes on it.
+    if (subresource_count_override != 0 && subresource_count_override <= 64) {
+        count = subresource_count_override;
+    }
+
+    // Per-entry (0x30 bytes): [+0] = resting state (checked when the subresource is touched for
+    // the FIRST time this frame - which a fresh clone always is), [+8] = current per-frame
+    // state (checked on same-frame subsequent touches), [+0x18] = last-touched frame stamp
+    // (leave it to the engine - it's NOT a subresource index). Setting BOTH state fields to
+    // COPY_DEST makes 0x14ab58260 return "no transition" so find() skips the registry walk.
+    static bool s_logged = false;
+    for (uint32_t sub = 0; sub < count; ++sub) {
+        uint8_t* const entry = base + (uintptr_t)sub * 0x30;
+        const uint32_t old0 = *(uint32_t*)(entry + 0);
+        const uint32_t old8 = *(uint32_t*)(entry + 8);
+
+        *(uint32_t*)(entry + 0) = d3d12_state;   // resting state (first-touch check)
+        *(uint32_t*)(entry + 8) = d3d12_state;   // current state  (same-frame check)
+
+        if (!s_logged) {
+            spdlog::info("[Flat3D] prime_resource_state tex={:x} base={:x} sub={} state={:#x} old[0]={:#x} old[8]={:#x} count={}",
+                (uintptr_t)tex, (uintptr_t)base, sub, d3d12_state, old0, old8, count);
+        }
+    }
+    s_logged = true;
+
+    // The copy-execution path (exe+0xaba8500) does a SEPARATE resource resolution that also
+    // walks the alias registry keyed on the native handle, gated by tex+0x158: nonzero => walk
+    // (crash for our unregistered clone), zero => read the native handle directly. Priming the
+    // STATE above handles the transition logic (find() no longer walks); clearing this flag
+    // makes the copy's resource-resolve take the direct-native path too. Safe now that the
+    // state is COPY_DEST-primed and the resource is COMMON (implicitly promoted by the copy).
+    *(volatile uint8_t*)((uintptr_t)tex + 0x158) = 0;
+}
+
+void* get_engine_native_resource_d3d12(Texture* tex) {
+    if (tex == nullptr) {
+        return nullptr;
+    }
+
+    // Update-resilient: Texture::get_d3d12_resource_container() bruteforce-scans for the
+    // container by its via.render.RenderResource typeinfo (Renderer.cpp, TDB>=71 path) rather
+    // than a hardcoded offset, and get_native_resource() reads the native at +get_runtime_size().
+    // On MHWilds this resolves to the SAME ID3D12Resource the engine copy_texture writes into -
+    // VERIFIED equal to the old hardcoded *(tex+0xf0)+0x20 (the "0xE0-NATIVE same=true" probe).
+    // See docs/FLAT3D_WILDS_RE.md ("native resource offset").
+    const auto container = tex->get_d3d12_resource_container();
+    return container != nullptr ? (void*)container->get_native_resource() : nullptr;
 }
 
 /*
@@ -1478,6 +1780,66 @@ E8 ? ? ? ?                                    call    create_render_target_view
 48 8B D8                                      mov     rbx, rax
 4C 89 BF F0 04 00 00                          mov     [rdi+4F0h], r15
 */
+// Optional per-thread override for create_render_target_view's arg0 (the render device /
+// context). On MHWilds the RTV factory dereferences arg0 and pulls the descriptor pool
+// from it; the persistent renderer->get_device() has no active pool, so a caller inside a
+// render-layer hook can set the live RenderContext here first.
+static thread_local void* g_create_rtv_device_override = nullptr;
+
+void set_create_rtv_device_override(void* device) {
+    g_create_rtv_device_override = device;
+}
+
+// Resolve the MHWilds render device that owns the RTV descriptor pool (device[0] = the
+// descriptor-heap manager). The engine's own resource-view factory thunks load this device
+// from a single global via `mov rcx,[rip+disp]` and then tail-call the worker. Every
+// view-factory thunk in the exe (77 of them) reads the SAME global, so we scan for the thunk
+// shape and read its device global directly - `device = *global`, no extra indirection.
+//   thunk: mov rcx,[rip+devA]; test rcx,rcx; jne worker;
+//          mov rcx,[rip+devB]; test rcx,rcx; jne worker2; xor ecx,ecx; jmp worker.
+// (The global lives in the section the protector renamed to ".tls", but it's accessed
+// RIP-relative - not gs-relative - so it's a flat regular global, readable from any thread.
+// The earlier singleton->[0x18] guess resolved to a different, pool-less object whose [0]
+// was persistently null.)
+static void* resolve_rtv_pool_device() {
+    static void** const rtv_device_global = []() -> void** {
+        const auto game = utility::get_executable();
+        const auto match = utility::scan(game,
+            "48 8B 0D ? ? ? ? 48 85 C9 0F 85 ? ? ? ? 48 8B 0D ? ? ? ? 48 85 C9 0F 85 ? ? ? ? 31 C9 E9");
+
+        if (!match) {
+            return nullptr;
+        }
+
+        return (void**)utility::calculate_absolute(*match + 3);
+    }();
+
+    if (rtv_device_global == nullptr) {
+        return nullptr;
+    }
+
+    return *rtv_device_global;
+}
+
+// True only when the RTV descriptor pool is actually live (device[0] = heap manager, whose
+// PoolSize at +0x5fc is > 0). Callers MUST check this before attempting a RenderTargetView
+// clone: RTV::clone() calls create_texture() first, so retrying a clone that would fail
+// leaks a texture every frame and exhausts the engine resource pool (-> crash).
+bool is_create_rtv_ready() {
+    const auto device = resolve_rtv_pool_device();
+    const auto manager = device != nullptr ? *(void**)device : nullptr;
+    const int32_t pool_size = manager != nullptr ? *(int32_t*)((uintptr_t)manager + 0x5fc) : -999;
+    const bool ready = manager != nullptr && pool_size > 0;
+
+    static uint32_t dbg = 0;
+    if ((dbg++ % 600) == 0) {
+        spdlog::info("[Flat3D] is_create_rtv_ready={} device={:x} manager={:x} pool_size={:#x}",
+            ready, (uintptr_t)device, (uintptr_t)manager, (uint32_t)pool_size);
+    }
+
+    return ready;
+}
+
 RenderTargetView* create_render_target_view(sdk::renderer::RenderResource* resource, void* desc) {
     static auto fn = []() -> RenderTargetView* (*)(void*, sdk::renderer::RenderResource* resource, void*) {
         spdlog::info("Searching for create_render_target_view");
@@ -1496,6 +1858,23 @@ RenderTargetView* create_render_target_view(sdk::renderer::RenderResource* resou
                 return result;
             }
 
+            // MHWilds (TDB 81): the call-site patterns above don't match (call sites
+            // changed). Resolve the factory WORKER directly by a unique instruction
+            // sequence inside it: mov rax,[rcx]; add rax,0x10; mov ecx,[rip]; mov rdx,
+            // gs:[0x58]; mov r15,[rdx+rcx*8]; mov [r15+0x20],rax (grabs the per-thread
+            // render context then stashes the resource). Verified unique in the exe.
+            const auto mid = utility::scan(game,
+                "48 8B 01 48 83 C0 10 8B 0D ? ? ? ? 65 48 8B 14 25 58 00 00 00 4C 8B 3C CA 49 89 87 20 00 00 00");
+
+            if (mid) {
+                const auto fn_start = utility::find_function_start_unwind(*mid);
+
+                if (fn_start) {
+                    spdlog::info("Found create_render_target_view (worker pattern): {:x}", *fn_start);
+                    return (RenderTargetView* (*)(void*, sdk::renderer::RenderResource*, void*))*fn_start;
+                }
+            }
+
             spdlog::error("Failed to find create_render_target_view (no ref)");
             return nullptr;
         }
@@ -1506,7 +1885,46 @@ RenderTargetView* create_render_target_view(sdk::renderer::RenderResource* resou
         return result;
     }();
 
-    return fn(nullptr, resource, desc);
+    // Guard against an unresolved scan (MHWilds: neither the primary nor fallback
+    // pattern matches) - calling a null fn is an RIP=0 crash.
+    if (fn == nullptr) {
+        return nullptr;
+    }
+
+    // arg0 is the render device. The MHWilds worker dereferences it and pulls the RTV
+    // descriptor-heap manager from device[0] - so it must be the specific render-system
+    // device that owns the pool, not renderer->get_device() (a different, pool-less
+    // instance -> "descriptor pool is empty. PoolSize(-1)"). resolve_rtv_pool_device()
+    // reads it from the same global the engine's own view-factory thunks use.
+    void* device = g_create_rtv_device_override;
+
+    if (device == nullptr) {
+        device = resolve_rtv_pool_device();
+    }
+
+    if (device == nullptr) {
+        const auto renderer = sdk::renderer::get_renderer();
+        device = renderer != nullptr ? renderer->get_device() : nullptr;
+    }
+
+    if (device == nullptr) {
+        return nullptr;
+    }
+
+    // Readiness guard: early in boot the render device's RTV descriptor pool isn't set up
+    // yet - the factory does `mov r12,[device]` (device[0] = heap manager) then reads the
+    // pool from it; if the manager is null (device not initialized) or its PoolSize
+    // (manager[0x5fc]) is <= 0 (uninitialized/empty), calling the factory faults or asserts.
+    // Return null instead (the caller retries next frame) until the pool is live.
+    if (g_create_rtv_device_override == nullptr) {
+        const auto manager = *(void**)device;
+
+        if (manager == nullptr || *(int32_t*)((uintptr_t)manager + 0x5fc) <= 0) {
+            return nullptr;
+        }
+    }
+
+    return fn(device, resource, desc);
 }
 
 ID3D12Resource* TargetState::get_native_resource_d3d12() const {

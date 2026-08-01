@@ -28,6 +28,7 @@ endif()
 option(DEVELOPER_MODE "" ON)
 option(REF_BUILD_FRAMEWORK "" ON)
 option(REF_BUILD_DEPENDENCIES "" ON)
+option(REF_LEIASR "" OFF)
 
 project(reframework
 	LANGUAGES
@@ -1450,6 +1451,10 @@ endif()
 # Target: REFramework
 if(REF_BUILD_FRAMEWORK AND CMAKE_SIZEOF_VOID_P EQUAL 8) # build-framework
 	set(CMKR_TARGET REFramework)
+	if(REF_LEIASR AND NOT DEFINED REF_LEIASR_SDK)
+	    set(REF_LEIASR_SDK "${CMAKE_SOURCE_DIR}/../LeiaSR64" CACHE PATH "Path to the LeiaSR (Simulated Reality) SDK root")
+	endif()
+
 	set(REFramework_SOURCES
 		cmake.toml
 		"src/D3D11Hook.cpp"
@@ -1541,6 +1546,17 @@ if(REF_BUILD_FRAMEWORK AND CMAKE_SIZEOF_VOID_P EQUAL 8) # build-framework
 		"src/mods/vr/D3D11Component.hpp"
 		"src/mods/vr/D3D12Component.cpp"
 		"src/mods/vr/D3D12Component.hpp"
+		"src/mods/vr/Flat3DAFW.cpp"
+		"src/mods/vr/Flat3DAFW.hpp"
+		"src/mods/vr/Flat3DCompose.cpp"
+		"src/mods/vr/Flat3DCompose.hpp"
+		"src/mods/vr/Flat3DDepth.cpp"
+		"src/mods/vr/Flat3DDepth.hpp"
+		"src/mods/vr/Flat3DGuiRedirect.cpp"
+		"src/mods/vr/Flat3DGuiRedirect.hpp"
+		"src/mods/vr/Flat3DLeiaSR.cpp"
+		"src/mods/vr/Flat3DLeiaSR.hpp"
+		"src/mods/vr/Flat3DNGX.cpp"
 		"src/mods/vr/OverlayComponent.cpp"
 		"src/mods/vr/OverlayComponent.hpp"
 		"src/mods/vr/d3d12/ComPtr.hpp"
@@ -1554,6 +1570,10 @@ if(REF_BUILD_FRAMEWORK AND CMAKE_SIZEOF_VOID_P EQUAL 8) # build-framework
 		"src/mods/vr/d3d12/TextureContext.hpp"
 		"src/mods/vr/games/RE8VR.cpp"
 		"src/mods/vr/games/RE8VR.hpp"
+		"src/mods/vr/pdafw/NGXDecl.hpp"
+		"src/mods/vr/pdafw/PDAFWPlugin.h"
+		"src/mods/vr/runtimes/Flat3D.cpp"
+		"src/mods/vr/runtimes/Flat3D.hpp"
 		"src/mods/vr/runtimes/OpenVR.cpp"
 		"src/mods/vr/runtimes/OpenVR.hpp"
 		"src/mods/vr/runtimes/OpenXR.cpp"
@@ -1590,6 +1610,12 @@ if(REF_BUILD_FRAMEWORK AND CMAKE_SIZEOF_VOID_P EQUAL 8) # build-framework
 		)
 	endif()
 
+	if(REF_LEIASR) # leiasr
+		target_compile_definitions(REFramework PUBLIC
+			REF_LEIASR
+		)
+	endif()
+
 	target_compile_features(REFramework PUBLIC
 		cxx_std_23
 	)
@@ -1607,9 +1633,33 @@ if(REF_BUILD_FRAMEWORK AND CMAKE_SIZEOF_VOID_P EQUAL 8) # build-framework
 		"${OPENXR_SOURCE_DIR}/src"
 	)
 
+	if(REF_LEIASR) # leiasr
+		target_include_directories(REFramework PUBLIC
+			"${REF_LEIASR_SDK}/include"
+			"${REF_LEIASR_SDK}/third_party/OpenCV/include"
+		)
+	endif()
+
 	target_link_directories(REFramework PUBLIC
 		"dependencies/openvr/lib/win64/"
 	)
+
+	if(REF_LEIASR) # leiasr
+		target_link_directories(REFramework PUBLIC
+			"${REF_LEIASR_SDK}/lib"
+			"${REF_LEIASR_SDK}/third_party/OpenCV/lib/x64"
+		)
+	endif()
+
+	if(REF_LEIASR) # leiasr
+		target_link_libraries(REFramework PUBLIC
+			simulatedreality
+			SimulatedRealityCore
+			SimulatedRealityDisplays
+			SimulatedRealityDirectX
+			opencv_world343
+		)
+	endif()
 
 	target_link_libraries(REFramework PUBLIC
 		REFrameworkSDK
@@ -1658,6 +1708,9 @@ if(REF_BUILD_FRAMEWORK AND CMAKE_SIZEOF_VOID_P EQUAL 8) # build-framework
 	    COMMAND ${CMAKE_COMMAND} -E echo "Generating commit hash..."
 	    COMMAND ${CMAKE_COMMAND} -E chdir ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/MakeCommitHash.bat
 	)
+	if(REF_LEIASR)
+	    set_property(TARGET REFramework APPEND_STRING PROPERTY LINK_FLAGS " /DELAYLOAD:simulatedreality.dll /DELAYLOAD:SimulatedRealityCore.dll /DELAYLOAD:SimulatedRealityDisplays.dll /DELAYLOAD:SimulatedRealityDirectX.dll /DELAYLOAD:opencv_world343.dll")
+	endif()
 
 endif()
 # Target: example_plugin

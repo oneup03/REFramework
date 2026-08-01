@@ -55,32 +55,50 @@ std::optional<std::string> TemporalUpscaler::on_initialize() {
     if (!m_backend_loaded) {
         spdlog::info("[TemporalUpscaler] Could not load PDPerfPlugin.dll, TemporalUpscaler will not work");
     } else {
-        for (auto i = 0; i <= TemporalUpscaler::PDUpscaleType::XESS; ++i) {
-            const auto is_available = IsUpscaleMethodAvailable(i);
-            const auto upscale_name = GetUpscaleMethodName(i);
-
-            if (upscale_name == nullptr) {
-                continue;
-            }
-
-            if (is_available) {
-                m_available_upscale_methods[upscale_name] = i;
-                m_available_upscale_method_names.push_back(upscale_name);
-                spdlog::info("[TemporalUpscaler] Upscale method {} is available", i, upscale_name);
-            } else {
-                spdlog::info("[TemporalUpscaler] Upscale method {} is not available", i, upscale_name);
-            }
-        }
-
-        if (m_available_upscale_methods.empty()) {
-            spdlog::info("[TemporalUpscaler] No upscale methods are available, TemporalUpscaler will not work");
-            m_backend_loaded = false;
-        } else {
-            m_upscale_type = (PDUpscaleType)m_available_upscale_methods[m_available_upscale_method_names[m_available_upscale_type]];
+        // This runs BEFORE the D3D device is handed to the plugin (SetupDirectX,
+        // in on_first_frame) and before InitLogDelegate - some backends (notably
+        // DLSS) can't report availability without a device, so an empty result
+        // here is NOT final. Keep m_backend_loaded=true so on_first_frame runs
+        // and re-enumerates; the definitive verdict is made there.
+        if (!enumerate_upscale_methods()) {
+            spdlog::info("[TemporalUpscaler] No upscale methods available yet (pre-device); will retry after SetupDirectX");
         }
     }
 
     return Mod::on_initialize();
+}
+
+bool TemporalUpscaler::enumerate_upscale_methods() {
+    m_available_upscale_methods.clear();
+    m_available_upscale_method_names.clear();
+
+    for (auto i = 0; i <= TemporalUpscaler::PDUpscaleType::XESS; ++i) {
+        const auto is_available = IsUpscaleMethodAvailable(i);
+        const auto upscale_name = GetUpscaleMethodName(i);
+
+        if (upscale_name == nullptr) {
+            continue;
+        }
+
+        if (is_available) {
+            m_available_upscale_methods[upscale_name] = i;
+            m_available_upscale_method_names.push_back(upscale_name);
+            spdlog::info("[TemporalUpscaler] Upscale method {} is available", i, upscale_name);
+        } else {
+            spdlog::info("[TemporalUpscaler] Upscale method {} is not available", i, upscale_name);
+        }
+    }
+
+    if (m_available_upscale_methods.empty()) {
+        return false;
+    }
+
+    if (m_available_upscale_type >= m_available_upscale_method_names.size()) {
+        m_available_upscale_type = 0;
+    }
+
+    m_upscale_type = (PDUpscaleType)m_available_upscale_methods[m_available_upscale_method_names[m_available_upscale_type]];
+    return true;
 }
 
 void TemporalUpscaler::on_config_load(const utility::Config& cfg) {
@@ -465,6 +483,19 @@ bool TemporalUpscaler::on_first_frame() {
         SetupDirectX(hook->get_device(), PDGraphicsAPI::D3D11);
     }
 
+    // If the pre-device enumeration in on_initialize came up empty, retry now:
+    // the plugin has the D3D device (SetupDirectX above) and the log delegate is
+    // wired, so backends that need a device to report availability can now answer
+    // (and any reasons they log will finally surface). This is the definitive
+    // verdict - if still empty, the backend truly can't work.
+    if (m_available_upscale_methods.empty()) {
+        if (!enumerate_upscale_methods()) {
+            spdlog::info("[TemporalUpscaler] No upscale methods are available after device init, TemporalUpscaler will not work");
+            m_backend_loaded = false;
+            return false;
+        }
+    }
+
     if (!init_upscale_features()) {
         return false;
     }
@@ -472,6 +503,21 @@ bool TemporalUpscaler::on_first_frame() {
     m_initialized = true;
 
     return true;
+}
+
+// InitUpscaler dives straight into the vendor runtime (NVIDIA NGX / FSR / XeSS).
+// Its CreateFeature can hard-fault on some titles - observed on MHWilds: an
+// access violation inside _nvngx.dll's NVSDK_NGX_D3D12_CreateFeature - with
+// resolution/format combos it dislikes. A fault there would take down the whole
+// game, so isolate the call behind SEH; on an exception we return nullptr and
+// the caller treats the upscaler as unavailable and keeps running without it.
+// Deliberately holds no C++ objects (SEH forbids stack unwinding here).
+static void* seh_init_upscaler(InitParams* params) {
+    __try {
+        return InitUpscaler(params);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
 }
 
 bool TemporalUpscaler::init_upscale_features() {
@@ -501,6 +547,11 @@ bool TemporalUpscaler::init_upscale_features() {
         out_w = bb_desc.Width;
         out_h = bb_desc.Height;
         out_format = bb_desc.Format;
+
+        // NOTE: changing this output format away from R10G10B10A2 did NOT fix
+        // MHWilds' DLSS CreateFeature failure (it fails with R16F too), so the
+        // 10-bit output format is not the cause - left as the real backbuffer
+        // format. The failure is inside the plugin/NGX CreateFeature path.
 
         for (auto& copier : m_copiers) {
             copier.setup();
@@ -547,12 +598,21 @@ bool TemporalUpscaler::init_upscale_features() {
     params.motionVetorsJittered = false;
     params.enableSharpening = m_sharpness->value();
     params.enableAutoExposure = false;
-    m_upscaled_textures[0] = InitUpscaler(&params);
+    m_upscaled_textures[0] = seh_init_upscaler(&params);
 
     // Right eye.
     if (VR::get()->is_hmd_active()) {
         params.id = get_evaluate_id(1);
-        m_upscaled_textures[1] = InitUpscaler(&params);
+        m_upscaled_textures[1] = seh_init_upscaler(&params);
+    }
+
+    // If the vendor runtime faulted (SEH-caught) or otherwise returned null, bail
+    // gracefully instead of dereferencing a null texture below - the game keeps
+    // running without the upscaler rather than crashing at boot.
+    if (m_upscaled_textures[0] == nullptr || (VR::get()->is_hmd_active() && m_upscaled_textures[1] == nullptr)) {
+        spdlog::error("[TemporalUpscaler] Upscaler feature creation failed (vendor runtime returned/threw null) - disabling upscaler");
+        release_upscale_features();
+        return false;
     }
 
     update_motion_scale();

@@ -24,7 +24,15 @@ public:
     // Layout (matches the #if blocks below):
     //   base (0x10): vtable + ref_count + render_frame
     //   +0x08 _tdb73_padding when: SF6, RE4, TDB >= 73, or TDB <= 67
-    //   +0x08 tdb82_padding   when: TDB >= 82
+    //   +0x08 tdb82_padding   when: TDB >= 81
+    //
+    // NOTE: the tdb82_padding was originally attributed to RE9 (TDB 82), but a raw
+    // memory dump of a via.render.TargetState on MHWilds (TDB 81) proved the Desc
+    // (rtvs ptr / num_rtv / rect) actually lives at base+0x20, i.e. Wilds ALSO has
+    // this extra 8-byte field. With the old `>= 82` threshold Wilds read every
+    // TargetState/Texture/DirectXResource member 8 bytes too early, so num_rtv and
+    // all native-resource pointers came back 0 — which is why the multipass color/
+    // depth harvest looked "impossible". Lowered the threshold to `>= 81`.
     static inline uintptr_t get_runtime_size() {
         const auto& gi = sdk::GameIdentity::get();
         const auto v = gi.tdb_ver();
@@ -33,8 +41,8 @@ public:
         if (gi.is_sf6() || gi.is_re4() || v >= 73 || v <= 67) {
             size += sizeof(void*); // _tdb73_padding
         }
-        if (v >= 82) {
-            size += sizeof(void*); // tdb82_padding
+        if (v >= 81) {
+            size += sizeof(void*); // tdb82_padding (present in MHWilds TDB 81 too)
         }
         return size;
     }

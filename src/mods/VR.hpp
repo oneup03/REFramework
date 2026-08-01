@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <bitset>
 #include <memory>
@@ -20,9 +21,12 @@
 #include "sdk/intrusive_ptr.hpp"
 #include "vr/D3D11Component.hpp"
 #include "vr/D3D12Component.hpp"
+#include "vr/Flat3DDepth.hpp"
+#include "vr/Flat3DAFW.hpp"
 #include "vr/OverlayComponent.hpp"
 #include "vr/runtimes/OpenXR.hpp"
 #include "vr/runtimes/OpenVR.hpp"
+#include "vr/runtimes/Flat3D.hpp"
 #include "vr/CameraDuplicator.hpp"
 
 #include "HookManager.hpp"
@@ -37,6 +41,25 @@ public:
         ALTERNATING, // AFR
         SEQUENTIAL_FRAME, // Two frames, synchronized
         MULTIPASS // Native stereo rendering, single frame
+    };
+
+    // Flatscreen 3D output formats. Combo order; translated to compose-shader
+    // mode constants in Flat3DCompose.
+    enum Flat3DOutputMode : int32_t {
+        FLAT3D_SBS,
+        FLAT3D_TAB,
+        FLAT3D_ROW_INTERLACED,
+        FLAT3D_COLUMN_INTERLACED,
+        FLAT3D_CHECKERBOARD,
+        FLAT3D_LEIA_SR,
+        FLAT3D_ANAGLYPH_RC,
+        FLAT3D_ANAGLYPH_RC_DUBOIS,
+        FLAT3D_ANAGLYPH_RC_HALFCOLOR,
+        FLAT3D_ANAGLYPH_GM,
+        FLAT3D_ANAGLYPH_GM_DUBOIS,
+        FLAT3D_ANAGLYPH_BLUE_AMBER,
+        FLAT3D_DEBUG_LEFT_ONLY,
+        FLAT3D_DEBUG_RIGHT_ONLY,
     };
 
 public:
@@ -119,6 +142,33 @@ public:
         return m_rendering_technique->value() == RenderingTechnique::MULTIPASS;
     }
 
+    bool is_using_sequential() const {
+        return m_rendering_technique->value() == RenderingTechnique::SEQUENTIAL_FRAME;
+    }
+
+    // True-sequential harvest for flat3d: main render pass = left eye, engine re-run = right eye,
+    // both at the same game tick (the re-run strips physics/anim/logic entries). Lets us reuse the
+    // multipass clone/harvest/tile-map plumbing for the sequential path.
+    bool is_using_flat3d_true_sequential() const {
+        return false; // flat3d sequential removed (structural squish + <1/2 perf); AFR+AFW is the path
+    }
+
+    // AFW (alternate frame warp): AFR renders ONE eye per frame from the single real camera (full
+    // post-process - no clone-camera color divergence), and the missing eye is synthesized by the
+    // PDAFWPlugin from this frame's depth + motion vectors. Rides the AFR technique.
+    bool is_using_flat3d_afw() const {
+        return is_using_flat3d() && is_using_afr() && m_flat3d_afw_enabled->value() && m_flat3d_afw.is_available();
+    }
+
+    // Accessors for the NGX (DLSS) harvest hook (lives outside the class).
+    vrmod::Flat3DAFW& get_flat3d_afw() { return m_flat3d_afw; }
+    int32_t get_left_eye_interval() const { return m_left_eye_interval; }
+
+    // Eye/pass index used by the projection/view hooks. Multipass keys off the render pass; flat3d
+    // true-sequential keys off inside_on_end (main pass=left(0), engine re-run=right(1)); everything
+    // else (AFR / VR sequential) keys off frame parity. Defined in VR.cpp (needs inside_on_end).
+    uint32_t get_eye_pass_index() const;
+
     RenderingTechnique get_rendering_technique() const {
         return (RenderingTechnique)m_rendering_technique->value();
     }
@@ -154,7 +204,7 @@ public:
     bool is_hmd_active() const {
         return get_runtime()->ready();
     }
-    
+
     bool is_openvr_loaded() const {
         return m_openvr != nullptr && m_openvr->loaded;
     }
@@ -162,6 +212,15 @@ public:
     bool is_openxr_loaded() const {
         return m_openxr != nullptr && m_openxr->loaded;
     }
+
+    bool is_flat3d_loaded() const {
+        return m_flat3d != nullptr && m_flat3d->loaded;
+    }
+
+    bool is_using_flat3d() const {
+        return get_runtime()->is_flat3d();
+    }
+
 
     bool is_using_hmd_oriented_audio() {
         return m_hmd_oriented_audio->value();
@@ -265,6 +324,8 @@ private:
 
     bool on_pre_overlay_layer_update(sdk::renderer::layer::Overlay* layer, void* render_context) override;
     bool on_pre_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* render_context) override;
+    void on_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* render_context) override; // POST-overlay: flat3d fallback harvest (HUD, but pre-final-encode)
+    void on_output_layer_draw(sdk::renderer::layer::Output* layer, void* render_context) override; // POST-output: latest hook, final tonemapped+HUD image
 
     bool on_pre_post_effect_layer_update(sdk::renderer::layer::PostEffect* layer, void* render_context) override;
     bool on_pre_post_effect_layer_draw(sdk::renderer::layer::PostEffect* layer, void* render_context) override;
@@ -276,6 +337,7 @@ private:
     void on_scene_layer_update(sdk::renderer::layer::Scene* layer, void* render_context) override;
     bool on_pre_scene_layer_draw(sdk::renderer::layer::Scene* layer, void* render_context) override;
 
+    bool on_pre_prepare_output_layer_draw(sdk::renderer::layer::PrepareOutput* layer, void* render_context) override;
     void on_prepare_output_layer_draw(sdk::renderer::layer::PrepareOutput* layer, void* render_context) override;
 
     struct SceneLayerData {
@@ -313,6 +375,7 @@ private:
     std::optional<std::string> initialize_openxr();
     std::optional<std::string> initialize_openxr_input();
     std::optional<std::string> initialize_openxr_swapchains();
+    std::optional<std::string> initialize_flat3d();
     std::optional<std::string> hijack_resolution();
     std::optional<std::string> hijack_input();
     std::optional<std::string> hijack_camera();
@@ -368,6 +431,8 @@ private:
     bool detect_controllers();
     bool is_any_action_down();
     void update_hmd_state();
+    void update_flat3d_params(); // separation/convergence/FoV auto-scale, before update_matrices
+    void draw_flat3d_ui(); // Flatscreen 3D section of on_draw_ui
     void update_action_states();
     void update_camera(); // if not in firstperson mode
     void update_camera_origin(); // every frame
@@ -409,6 +474,7 @@ private:
     std::shared_ptr<VRRuntime> m_runtime{std::make_shared<VRRuntime>()}; // will point to the real runtime if it exists
     std::shared_ptr<runtimes::OpenVR> m_openvr{std::make_shared<runtimes::OpenVR>()};
     std::shared_ptr<runtimes::OpenXR> m_openxr{std::make_shared<runtimes::OpenXR>()};
+    std::shared_ptr<runtimes::Flat3D> m_flat3d{std::make_shared<runtimes::Flat3D>()};
 
     Vector4f m_standing_origin{ 0.0f, 1.5f, 0.0f, 0.0f };
     glm::quat m_rotation_offset{ glm::identity<glm::quat>() };
@@ -499,6 +565,48 @@ private:
     vrmod::D3D12Component m_d3d12{};
     vrmod::OverlayComponent m_overlay_component{};
     vrmod::CameraDuplicator m_camera_duplicator{};
+    vrmod::Flat3DDepth m_flat3d_depth_sampler{};
+    // AFW (alternate frame warp): PDAFWPlugin binding + plugin-side per-eye buffers. Init'd from
+    // D3D12Component once the device/queue exist; unavailable (with status text) if the real dll
+    // isn't beside the game exe.
+    vrmod::Flat3DAFW m_flat3d_afw{};
+
+    // AFW per-frame camera matrices, recorded by the view/proj hooks each render pass - BOTH eyes,
+    // same-tick (the pass's own eye + the other computed from the same base). Present-time code
+    // indexes by ITS OWN fill parity, avoiding the hooks' one-frame-ahead parity skew.
+    struct AfwFrameData {
+        Matrix4x4f view[2]{glm::identity<Matrix4x4f>(), glm::identity<Matrix4x4f>()};
+        Matrix4x4f proj[2]{glm::identity<Matrix4x4f>(), glm::identity<Matrix4x4f>()};
+        int32_t rfc{-1}; // render frame the matrices were recorded on
+        bool valid{false};
+    } m_afw_frame{};
+    // Frame-stamped ring (UEVR-3D keeps a 3-deep history + offset guard for the same reason): the
+    // game thread may already have recorded frame N+1's matrices by the time frame N's warp runs.
+    // Consumers look up their own frame; fall back to the live struct on a miss.
+    AfwFrameData m_afw_frame_ring[4]{};
+
+public:
+    const AfwFrameData& get_afw_frame() const { return m_afw_frame; }
+    const AfwFrameData& get_afw_frame_for(int32_t rfc) const {
+        const auto& e = m_afw_frame_ring[rfc & 3];
+        if (e.valid && e.rfc == rfc) {
+            return e;
+        }
+        // The hooks read the frame counter one ahead of present for the same logical frame
+        // (observed: exact-stamp lookups always miss by +1).
+        const auto& e1 = m_afw_frame_ring[(rfc + 1) & 3];
+        return (e1.valid && e1.rfc == rfc + 1) ? e1 : m_afw_frame;
+    }
+    bool afw_per_eye_dlss_enabled() const { return true; } // settled always-on
+    bool afw_dlss_mv_feed_enabled() const { return true; } // settled always-on
+    float afw_obj_motion_scale() const { return m_flat3d_afw_obj_motion->value(); }
+
+
+    // AFW depth/motion-vector sources: the LIVE engine depth + VelocityTarget natives (captured at
+    // the overlay hook; copied at present time by run_flat3d_afw with our own command list - the
+    // engine copy path crashes on Wilds for depth).
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_afw_depth_tex{};
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_afw_mv_tex{};
 
     template <typename T> using ComPtr = Microsoft::WRL::ComPtr<T>;
 
@@ -506,8 +614,34 @@ private:
         std::array<d3d12::TextureContext, 2> eye_contexts{}; // For the SRV
         std::array<ComPtr<ID3D12Resource>, 2> eye_textures{};
         std::array<sdk::intrusive_ptr<sdk::renderer::Texture>, 2> native_res_copies{}; // used with TemporalUpscaler disabled
+        // Flat3D: per-eye clone of the PrepareOutput's TargetState. We set_output_state
+        // to redirect each eye's prepared color INTO its clone; because the engine
+        // renders into it, the clone is a real, state-tracked render target we can read
+        // safely (unlike a bare create_texture clone, which the command executor can't
+        // resolve). See VR::on_pre_prepare_output_layer_draw.
+        std::array<sdk::intrusive_ptr<sdk::renderer::TargetState>, 2> flat3d_output_clones{};
+        // Flat3D RTV-swap redirect: a per-eye clone of the output RTV. We set_rtv it into
+        // the eye's output TargetState so the engine renders that eye into OUR private
+        // texture (which it then tracks). create_render_target_view resolves on MHWilds
+        // (create_target_state does not, so we swap the RTV instead of cloning the whole
+        // TargetState). Read at present time - never mid-frame - so no GPU race.
+        std::array<sdk::intrusive_ptr<sdk::renderer::RenderTargetView>, 2> flat3d_eye_rtvs{};
+        // The texture backing each eye's clone RTV, kept DIRECTLY from the manual clone -
+        // the clone RTV's get_texture_d3d12() reads null (the worker doesn't populate that
+        // member for externally-created RTVs), so we track the texture ourselves.
+        std::array<sdk::intrusive_ptr<sdk::renderer::Texture>, 2> flat3d_eye_textures{};
         std::array<uint32_t, 2> allocated_size{};
         uint32_t pass{0};
+        // Flat3D GUI-match: a clone of the PRIMARY eye's target harvested at the PRE-overlay hook
+        // (scene only, no GUI). The compose diffs the post-overlay primary eye against this to build a
+        // GUI mask, then paints the primary eye's GUI onto the clone eye - so both eyes show the same
+        // GUI at screen depth while the backgrounds stay stereo. Allocated alongside native_res_copies.
+        sdk::intrusive_ptr<sdk::renderer::Texture> pre_left_copy{};
+        ComPtr<ID3D12Resource> pre_left_texture{};
+        // Same for the RIGHT eye - needed to depth-SHIFT the matched GUI without ghosting the clone
+        // eye's own baked HUD (we repaint the isolated GUI over this scene-only base).
+        sdk::intrusive_ptr<sdk::renderer::Texture> pre_right_copy{};
+        ComPtr<ID3D12Resource> pre_right_texture{};
     } m_multipass{};
     
 
@@ -589,7 +723,7 @@ private:
     const ModSlider::Ptr m_motion_controls_inactivity_timer{ ModSlider::create(generate_name("MotionControlsInactivityTimer"), 30.0f, 100.0f, 30.0f) };
     const ModSlider::Ptr m_joystick_deadzone{ ModSlider::create(generate_name("JoystickDeadzone"), 0.01f, 0.9f, 0.15f) };
     const ModSlider::Ptr m_ui_scale_option{ ModSlider::create(generate_name("2DUIScale"), 1.0f, 100.0f, 12.0f) };
-    const ModSlider::Ptr m_ui_distance_option{ ModSlider::create(generate_name("2DUIDistance"), 0.01f, 100.0f, 1.0f) };
+    const ModSlider::Ptr m_ui_distance_option{ ModSlider::create(generate_name("2DUIDistance"), 0.01f, 8.0f, 1.0f) };
     const ModSlider::Ptr m_world_ui_scale_option{ ModSlider::create(generate_name("WorldSpaceUIScale"), 1.0f, 100.0f, 15.0f) };
     const ModSlider::Ptr m_resolution_scale{ ModSlider::create(generate_name("OpenXRResolutionScale"), 0.1f, 5.0f, 1.0f) };
 
@@ -632,6 +766,142 @@ private:
 #endif
 #endif
 
+    // Flatscreen 3D output settings (always enabled/active when no HMD runtime is present;
+    // the Enabled/Active toggles are retired)
+    const ModCombo::Ptr m_flat3d_output_mode{
+        ModCombo::create(generate_name("Flat3D_OutputMode"),
+        {
+            "Side-by-Side",
+            "Top-and-Bottom",
+            "Row Interlaced",
+            "Column Interlaced",
+            "Checkerboard",
+            "LeiaSR (Autostereo)",
+            "Anaglyph Red-Cyan",
+            "Anaglyph Red-Cyan (Dubois)",
+            "Anaglyph Red-Cyan (Half-Color)",
+            "Anaglyph Green-Magenta",
+            "Anaglyph Green-Magenta (Dubois)",
+            "Anaglyph Blue-Amber",
+            "Debug: Left Eye Only",
+            "Debug: Right Eye Only"
+        }, FLAT3D_SBS)
+    };
+    const ModToggle::Ptr m_flat3d_eye_swap{ ModToggle::create(generate_name("Flat3D_EyeSwap"), false) };
+    const ModSlider::Ptr m_flat3d_depth{ ModSlider::create(generate_name("Flat3D_Depth"), 0.0f, 3.0f, 0.4f) };
+    const ModSlider::Ptr m_flat3d_convergence{ ModSlider::create(generate_name("Flat3D_Convergence"), 0.01f, 4.0f, 2.5f) };
+    const ModSlider::Ptr m_flat3d_reference_fov{ ModSlider::create(generate_name("Flat3D_ReferenceFOV"), 10.0f, 120.0f, 70.0f) };
+    const ModToggle::Ptr m_flat3d_crop_eyes_169{ ModToggle::create(generate_name("Flat3D_CropEyesTo169"), false) };
+    const ModToggle::Ptr m_flat3d_swap_shear_sign{ ModToggle::create(generate_name("Flat3D_SwapShearSign"), false) };
+    const ModToggle::Ptr m_flat3d_auto_convergence{ ModToggle::create(generate_name("Flat3D_AutoConvergence"), false) };
+    const ModSlider::Ptr m_flat3d_max_popout{ ModSlider::create(generate_name("Flat3D_MaxPopoutPercent"), 0.1f, 5.0f, 1.5f) };
+    const ModSlider::Ptr m_flat3d_autoconv_smoothing{ ModSlider::create(generate_name("Flat3D_AutoConvSmoothing"), 0.01f, 0.25f, 0.08f) };
+    const ModToggle::Ptr m_flat3d_dynamic_crosshair{ ModToggle::create(generate_name("Flat3D_DynamicCrosshair"), false) };
+    const ModSlider::Ptr m_flat3d_crosshair_depth{ ModSlider::create(generate_name("Flat3D_CrosshairFallbackDepth"), 0.1f, 100.0f, 10.0f) };
+    const ModToggle::Ptr m_flat3d_swap_shift_sign{ ModToggle::create(generate_name("Flat3D_SwapShiftSign"), false) };
+    // World-space GUI (multipass): map screen GUI onto a camera-facing plane at this depth (world
+    // units / metres). Both eyes render it -> fixes the per-eye divergence AND gives adjustable
+    // GUI depth. World-anchored markers keep their own depth (they have a mesh -> skipped).
+    // Live tuning for the world-GUI plane (camera handedness/scale unknown until tested in real
+    // gameplay): flip the camera forward, and a size multiplier if the plane is too big/small.
+    // Menus/title: the clone eye renders the GUI at a divergent state. Mirror the primary eye into
+    // both clones so the GUI matches exactly (flattens stereo - fine on menus, turn off in gameplay).
+    // Stereo-preserving GUI match: diff the primary eye's post-overlay vs pre-overlay (scene-only) to
+    // isolate the GUI, then paint it onto the clone eye. Both eyes show identical GUI at screen depth
+    // while backgrounds stay stereo. Preferred over MirrorEyes (which flattens everything).
+    // Debug: output the isolated GUI mask (white=GUI) instead of the composed image, to tune threshold.
+    // Matched-GUI depth: per-eye horizontal disparity (eye-UV units) applied oppositely to the isolated
+    // GUI. 0 = screen depth; +/- pushes the whole HUD behind/in front of the screen. UEVR-style depth
+    // without world-space conversion (which is invisible on Wilds).
+    // (Overlay-RT redirect / GUI separation is settled ALWAYS ON: the engine's GUI draw is
+    // redirected into our own transparent-cleared per-eye textures (Flat3DGuiRedirect) and
+    // composited per-eye at the GUI plane's disparity - warp inputs stay naturally hudless.)
+    // (GUI capture eye phase is hardcoded swapped: RE computes world-anchored GUI positions
+    // during the game UPDATE phase, before the render-frame counter increments, so a frame's GUI
+    // content carries the PREVIOUS frame's eye projection and belongs in the opposite slot.
+    // User-validated twice in gameplay 2026-07-31.)
+    // Set by the present-time display-native check; drives the pixel-exactness warning for
+    // interlaced/checkerboard/LeiaSR modes.
+    std::atomic<bool> m_flat3d_native_mismatch{false};
+    // (Native-output override is always on: ResizeBuffers substitutes the display's physical
+    // resolution; the compose samples the engine-believed sub-region.)
+    // AFW (alternate frame warp) settings. Enabled = use the PDAFWPlugin to warp the missing AFR eye
+    // (only takes effect when the AFR technique is selected and the real plugin dll initialized).
+    const ModToggle::Ptr m_flat3d_afw_enabled{ ModToggle::create(generate_name("Flat3D_AFW"), true) };
+    // Warp mode A/B for the disocclusion halo / noise around foreground objects:
+    // Combined (default) = other-eye depth reprojection blended with same-eye MV history;
+    // Other-eye only isolates the depth-reprojection layer (halo = edge stretch);
+    // Previous-frame only isolates the history layer. (Plugin FrameWarpMode.)
+    const ModCombo::Ptr m_flat3d_afw_mode{
+        ModCombo::create(generate_name("Flat3D_AFW_Mode"),
+        {
+            "Combined (other-eye + history)",
+            "Other-eye only (depth reprojection)",
+            "Previous-frame only (MV history)",
+        }, 0)
+    };
+    // (ClearBeforeWarping is settled OFF: the user A/B showed clearing makes the shadow-halo
+    // flicker WORSE - stale-pixel fill partially hides the disocclusion holes.)
+    // Foreground depth-edge dilation radius (px) fed to the warp: reversed-Z max filter widens
+    // each silhouette so edge pixels reproject WITH the object instead of flickering between
+    // foreground/background (the depth-reprojection halo the user isolated). 0 = off.
+    const ModSlider::Ptr m_flat3d_afw_depth_dilation{ ModSlider::create(generate_name("Flat3D_AFW_DepthDilation"), 0.0f, 4.0f, 1.0f) };
+    // v3 warp object motion: add this frame's per-object motion (raw MV minus camera temporal
+    // flow, same-frame extraction) to the camera-only eye-jump field, so movers keep advancing in
+    // the warp's history layer (fixes half-rate character stutter). 0 = off (pure camera field).
+    // Foliage self-motion is the historical flicker risk - gated by the motion threshold below.
+    const ModSlider::Ptr m_flat3d_afw_obj_motion{ ModSlider::create(generate_name("Flat3D_AFW_ObjMotion"), 0.0f, 8.0f, 3.0f) };
+    // Plugin-side per-object motion gate (pixels): with object motion in the field, small motions
+    // (wind-blown foliage) below this are ignored by the warp while large mover motion passes.
+    // (Inert while the field was camera-only - there was nothing to gate.)
+    const ModSlider::Ptr m_flat3d_afw_motion_thresh{ ModSlider::create(generate_name("Flat3D_AFW_MotionThreshold"), 0.0f, 60.0f, 25.0f) };
+    const ModToggle::Ptr m_flat3d_afw_debug{ ModToggle::create(generate_name("Flat3D_AFW_Debug"), false) }; // log readbacks/diagnostics only
+    const ModToggle::Ptr m_flat3d_afw_plugin_debug{ ModToggle::create(generate_name("Flat3D_AFW_PluginDebug"), false) }; // plugin's own debug view (changes rendering)
+    // (Synthetic camera-only MV field + CombinedWarping are now ALWAYS ON - validated by burst
+    // readbacks 2026-07-30: field matches raw MVs to the 3rd decimal on static geometry, and
+    // camera-only displacement keeps wind-blown foliage from warping by its own animation.
+    // The sep-scale depth probe, matrix-transpose experiment, and the v2 object-motion feed term
+    // are settled and removed: scale 1, no transpose, camera-only field.)
+    // (Per-eye DLSS histories + same-eye MV feed are settled ALWAYS ON: per-eye histories fix
+    // the cross-eye TAA ghosting, and the same-eye N->N-2 feed fixes the under-accumulation
+    // noise those histories would otherwise cause. Both user-validated.)
+
+    // Flatscreen 3D transient state: game-projection terms recorded in the
+    // projection hook (render thread) and consumed by update_flat3d_params.
+    std::atomic<float> m_flat3d_game_p00{1.0f};
+    std::atomic<float> m_flat3d_game_p11{1.0f};
+    float m_flat3d_fov_scale_ema{1.0f};
+
+    // Flat3D UI extraction (multipass): redirect the PRIMARY eye's Overlay draw into a private
+    // transparent target so we capture the UI ONLY (icons/highlights/text), then composite it
+    // onto BOTH eyes with a per-eye depth shift + fit-scale (UEVR-style). Increment 1 just
+    // validates the capture. Toggle for A/B; targets are engine clones kept across frames.
+    // WIP UI extraction. Redirect-render approach is BLOCKED (engine can't render into an
+    // unregistered create_texture clone as RENDER_TARGET - not implicitly promotable, no barrier
+    // injection available). Off by default; next approach = read the engine's OWN GUI target.
+    bool m_flat3d_extract_ui{false};    // BASELINE: extraction off - confirm heartbeat grows + no rehook loop
+    bool m_flat3d_ui_diag{true};
+    bool m_flat3d_ui_debug_show{false};
+    // MHWilds can't clone a whole TargetState (create_target_state doesn't resolve), so we clone
+    // just the RTV (create_render_target_view DOES resolve) and set_rtv it into the existing
+    // overlay target state, restoring the original RTV after the draw.
+    sdk::intrusive_ptr<sdk::renderer::Texture> m_flat3d_ui_tex{};        // direct texture clone (native resolves)
+    sdk::intrusive_ptr<sdk::renderer::RenderTargetView> m_flat3d_ui_rtv{};       // RTV pointing at m_flat3d_ui_tex
+    sdk::intrusive_ptr<sdk::renderer::RenderTargetView> m_flat3d_ui_saved_rtv{}; // engine's real RTV, restored post-draw
+    bool m_flat3d_ui_backed{false};
+    bool m_flat3d_ui_redirect_ready{false}; // defer redirect until tile-mapping completed a prior frame
+    // Physical D3D12 state of the UI clone - WE cycle it with explicit barriers (the engine can't,
+    // it's unregistered): COMMON -> RENDER_TARGET (engine draws) -> COMMON (next frame).
+    D3D12_RESOURCE_STATES m_flat3d_ui_state{D3D12_RESOURCE_STATE_COMMON};
+    ID3D12Resource* m_flat3d_ui_native{nullptr}; // cached native of m_flat3d_ui_tex (for barriers)
+
+    // Auto-convergence state (only touched from update_flat3d_params)
+    float m_flat3d_znear_ema{-1.0f};
+    float m_flat3d_inv_conv_ema{-1.0f};
+    std::array<float, 5> m_flat3d_znear_history{};
+    uint32_t m_flat3d_znear_history_count{0};
+    uint32_t m_flat3d_znear_history_idx{0};
+
     bool m_disable_projection_matrix_override{ false };
     bool m_disable_gui_camera_projection_matrix_override{ false };
     bool m_disable_view_matrix_override{false};
@@ -664,7 +934,26 @@ private:
         *m_resolution_scale,
         *m_desktop_fix,
         *m_desktop_fix_skip_present,
-        *m_enable_asynchronous_rendering
+        *m_enable_asynchronous_rendering,
+        *m_flat3d_output_mode,
+        *m_flat3d_eye_swap,
+        *m_flat3d_depth,
+        *m_flat3d_convergence,
+        *m_flat3d_reference_fov,
+        *m_flat3d_crop_eyes_169,
+        *m_flat3d_swap_shear_sign,
+        *m_flat3d_auto_convergence,
+        *m_flat3d_max_popout,
+        *m_flat3d_autoconv_smoothing,
+        *m_flat3d_dynamic_crosshair,
+        *m_flat3d_crosshair_depth,
+        *m_flat3d_swap_shift_sign,
+        *m_flat3d_afw_mode,
+        *m_flat3d_afw_depth_dilation,
+        *m_flat3d_afw_obj_motion,
+        *m_flat3d_afw_motion_thresh,
+        *m_flat3d_afw_debug,        // persisted so headless tests can drive the debug views via config
+        *m_flat3d_afw_plugin_debug,
     };
 
     bool m_use_rotation{true};

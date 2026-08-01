@@ -273,9 +273,16 @@ void CameraDuplicator::clone_camera() {
         "worldtour.bWTCameraController", // this causes the camera to become the "main" camera which is NOT what we want, it breaks the real main camera
         "camera.MainCameraController", // also breaks the real main camera
         "camera.CameraSystem", // also breaks the real main camera
-        "bPostProcessController",
         "MainCameraDestroyChecker",
     };
+
+    // EXPERIMENT (flat3d): bPostProcessController drives the scene's color grade / tonemapping.
+    // Stripping it leaves the clone (2nd eye) ungraded -> warm(left)/blue(right) divergence.
+    // Keep it for flat3d (the camera-hijack controllers above are still stripped, so it should
+    // not steal main-camera status). VR keeps stripping it.
+    if (!VR::get()->is_using_flat3d()) {
+        game_framework_components.insert("bPostProcessController");
+    }
 
     // Add new components to illegal_components with the game project name prepended to the game_framework_components
     for (auto& fwcomp : game_framework_components) {

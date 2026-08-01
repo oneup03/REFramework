@@ -675,6 +675,31 @@ std::optional<Vector2f> world_to_screen(const Vector3f& world_pos);
 ConstantBuffer* create_constant_buffer(void* desc);
 TargetState* create_target_state(TargetState::Desc* desc);
 Texture* create_texture(Texture::Desc* desc);
+// MHWilds: prime a create_texture'd clone's per-subresource state tracker to COPY_DEST so the
+// engine copy_texture's dst-resolve takes the no-transition fast path (avoids the executor's
+// find() walking off the end of the resource registry for an unregistered clone -> crash).
+void prime_copy_dest_state(Texture* tex);
+// Prime the engine's per-subresource state tracker (tex+0x100) to an arbitrary D3D12 state so the
+// executor takes the no-transition fast path for a create_texture clone (which has no registry
+// entry). prime_copy_dest_state == prime_resource_state(tex, 0x400 COPY_DEST). Use 0x4
+// RENDER_TARGET for a clone the engine renders INTO (e.g. a redirected overlay RTV).
+// subresource_count_override: pass mips*arr*planes for multi-plane (depth-stencil) textures (D32S8
+// has 2 planes; the unprimed stencil plane otherwise crashes the executor); 0 = auto (mips*arr).
+void prime_resource_state(Texture* tex, uint32_t d3d12_state, uint32_t subresource_count_override = 0);
+// Returns the native ID3D12Resource the engine's copy executor actually writes/reads for this
+// texture: *(tex+0xf0)+0x20. On MHWilds this DIFFERS from get_d3d12_resource_container()->
+// get_native_resource() (SDK offset 0xE0) - a create_texture clone used as a copy dst must be
+// read back through THIS native to see what the copy wrote (otherwise you read a different,
+// uninitialized resource -> black).
+void* get_engine_native_resource_d3d12(Texture* tex);
 RenderTargetView* create_render_target_view(sdk::renderer::RenderResource* resource, void* desc);
+// Set (per-thread) the render device/context create_render_target_view passes as arg0.
+// Needed on MHWilds where the RTV factory pulls the descriptor pool from arg0; pass the
+// live RenderContext from inside a render-layer hook, then clear it (nullptr) afterwards.
+void set_create_rtv_device_override(void* device);
+// True only when the RTV descriptor pool is live. MUST be checked before a RenderTargetView
+// clone: RTV::clone() calls create_texture() first, so retrying a clone that would fail
+// leaks a texture per frame and exhausts the engine resource pool (crash).
+bool is_create_rtv_ready();
 }
 }
