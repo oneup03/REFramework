@@ -636,6 +636,23 @@ void VR::on_overlay_layer_draw(sdk::renderer::layer::Overlay* layer, void* rende
     const auto scene_layers = m_camera_duplicator.get_relevant_scene_layers();
     const auto parent = (sdk::renderer::layer::Scene*)layer->get_parent();
 
+    // Engine-native UI target lead (see docs/FLAT3D_WILDS_RE.md 2.14): RE9's AFW build reads the
+    // engine's own UI buffer instead of capturing the GUI. On Wilds only the ENABLE side is
+    // reflected (via.render.layer.Scene::get_UseUIColorAlpha, DLSSUpscalingInterface::
+    // set_UseUIColorAlpha) - the texture getters are native-only. Log whether the engine is
+    // already producing a UI colour+alpha target: if it ever reads true, hunting the native
+    // texture pointer becomes worthwhile and the whole D3D12 redirect could retire.
+    if (is_using_flat3d()) {
+        static bool s_ui_state_logged = false;
+        if (!s_ui_state_logged && parent != nullptr) {
+            s_ui_state_logged = true;
+            const auto scene_uica = sdk::call_object_func_easy<bool>(parent, "get_UseUIColorAlpha");
+            const auto mask_ui = sdk::call_object_func_easy<bool>(layer, "get_UseMaskUITarget");
+            spdlog::info("[Flat3D] engine UI targets: Scene.UseUIColorAlpha={} Overlay.UseMaskUITarget={}",
+                scene_uica, mask_ui);
+        }
+    }
+
     // AFW (AFR + warp): single camera, single scene layer. NO engine copies here - the engine's
     // copy_texture executor CRASHES on Wilds for depth (and cloning is fragile). Instead we just
     // capture the LIVE depth/MV natives; run_flat3d_afw copies them at present time with OUR OWN
@@ -1284,8 +1301,95 @@ void VR::on_lua_state_created(sol::state& lua) {
     lua["vrmod"] = this;
 }
 
+// One-shot reflection probe for the engine's NATIVE UI-color-alpha / hudless render targets.
+// PureDark's RE9 AFW build reads the engine's own UI buffer straight off the overlay layer
+// (reflection field "UIBufferTexturePtr") instead of capturing the GUI. Wilds' reflection DB
+// contains the equivalent family (setUseUIColorAlpha / get_UIColorAlphaTexPtr /
+// getDisplayUIColorAlphaTexPtr / get_HudlessTexPtr / getGUIBufferUITarget ...), which - if it is
+// reachable and can be switched on - would replace BOTH the D3D12 overlay-RT redirect and the
+// pre/post hudless clones with plain reflection reads. This logs every type exposing those
+// members so we can find the owner; it runs once and costs nothing afterwards.
+void VR::flat3d_probe_engine_ui_targets() {
+    static bool s_done = false;
+    if (s_done) {
+        return;
+    }
+    s_done = true;
+
+    const auto tdb = sdk::RETypeDB::get();
+    if (tdb == nullptr) {
+        spdlog::warn("[Flat3D-UIProbe] no TDB");
+        return;
+    }
+
+    static constexpr std::string_view k_keys[]{
+        "UIColorAlpha", "Hudless", "GUIBufferUITarget", "UITarget", "UIBufferTexture"};
+
+    const auto matches = [](const char* name) {
+        if (name == nullptr) {
+            return false;
+        }
+        const std::string_view sv{name};
+        for (const auto& k : k_keys) {
+            if (sv.find(k) != std::string_view::npos) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    uint32_t hits = 0;
+    const auto num_types = tdb->get_num_types();
+
+    for (uint32_t i = 0; i < num_types; ++i) {
+        auto* t = tdb->get_type(i);
+        if (t == nullptr) {
+            continue;
+        }
+
+        std::string type_name{};
+
+        for (auto& m : t->get_methods()) {
+            const auto name = m.get_name();
+            if (!matches(name)) {
+                continue;
+            }
+            if (type_name.empty()) {
+                type_name = t->get_full_name();
+            }
+            const auto ret = m.get_return_type();
+            spdlog::info("[Flat3D-UIProbe] METHOD {}::{}() -> {} (params={})", type_name, name,
+                ret != nullptr ? ret->get_full_name() : "?", m.get_num_params());
+            ++hits;
+        }
+
+        for (auto* f : t->get_fields()) {
+            if (f == nullptr) {
+                continue;
+            }
+            const auto name = f->get_name();
+            if (!matches(name)) {
+                continue;
+            }
+            if (type_name.empty()) {
+                type_name = t->get_full_name();
+            }
+            const auto ft = f->get_type();
+            spdlog::info("[Flat3D-UIProbe] FIELD  {}::{} : {}", type_name, name,
+                ft != nullptr ? ft->get_full_name() : "?");
+            ++hits;
+        }
+    }
+
+    spdlog::info("[Flat3D-UIProbe] scan complete: {} member(s) across {} types", hits, num_types);
+}
+
 std::optional<std::string> VR::initialize_flat3d() {
     spdlog::info("[VR] Initializing Flatscreen 3D output (no HMD)");
+
+    if (m_flat3d_afw_debug->value()) {
+        flat3d_probe_engine_ui_targets(); // ~321k types; opt-in (see docs/FLAT3D_WILDS_RE.md 2.14)
+    }
 
     m_flat3d = std::make_shared<runtimes::Flat3D>();
     m_flat3d->loaded = true;
@@ -4990,7 +5094,8 @@ void VR::draw_flat3d_ui() {
     if (m_flat3d_afw_enabled->value() && m_flat3d_afw.is_available()) {
         m_flat3d_afw_mode->draw("  AFW: warp mode (halo/noise A/B)");
         m_flat3d_afw_depth_dilation->draw("  AFW: depth edge dilation px (silhouette halo fix; 0 = off)");
-        m_flat3d_afw_obj_motion->draw("  AFW: warp object motion (movers anti-stutter; 0 = off)");
+        m_flat3d_afw_mv_field_mode->draw("  AFW: MV field mode (object-only = plugin reprojects)");
+        m_flat3d_afw_obj_motion->draw("  AFW: warp object motion (movers anti-stutter; ~1 in object-only mode)");
         if (m_flat3d_afw_obj_motion->value() > 0.0f) {
             m_flat3d_afw_motion_thresh->draw("  AFW: motion threshold px (foliage gate for object motion)");
         }

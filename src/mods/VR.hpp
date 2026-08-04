@@ -376,6 +376,8 @@ private:
     std::optional<std::string> initialize_openxr_input();
     std::optional<std::string> initialize_openxr_swapchains();
     std::optional<std::string> initialize_flat3d();
+    // One-shot reflection scan for the engine's native UI-color-alpha / hudless targets (see .cpp).
+    void flat3d_probe_engine_ui_targets();
     std::optional<std::string> hijack_resolution();
     std::optional<std::string> hijack_input();
     std::optional<std::string> hijack_camera();
@@ -600,6 +602,7 @@ public:
     bool afw_per_eye_dlss_enabled() const { return true; } // settled always-on
     bool afw_dlss_mv_feed_enabled() const { return true; } // settled always-on
     float afw_obj_motion_scale() const { return m_flat3d_afw_obj_motion->value(); }
+    bool afw_mv_field_object_only() const { return m_flat3d_afw_mv_field_mode->value() == 1; }
 
 
     // AFW depth/motion-vector sources: the LIVE engine depth + VelocityTarget natives (captured at
@@ -854,7 +857,20 @@ public:
     // Plugin-side per-object motion gate (pixels): with object motion in the field, small motions
     // (wind-blown foliage) below this are ignored by the warp while large mover motion passes.
     // (Inert while the field was camera-only - there was nothing to gate.)
-    const ModSlider::Ptr m_flat3d_afw_motion_thresh{ ModSlider::create(generate_name("Flat3D_AFW_MotionThreshold"), 0.0f, 60.0f, 25.0f) };
+    const ModSlider::Ptr m_flat3d_afw_motion_thresh{ ModSlider::create(generate_name("Flat3D_AFW_MotionThreshold"), 0.0f, 100.0f, 25.0f) };
+    // MV field decomposition A/B. Synthetic eye-jump (default, what we shipped): our compute pass
+    // writes the same-tick eye parallax into the field and the plugin displaces by it.
+    // Object-only: the field carries ONLY per-object motion and the plugin derives the parallax
+    // from CameraData + depth (MVType::ObjectOnly). The second is the cleaner decomposition -
+    // objects have NOT moved between the two eyes of one tick, so object motion in the
+    // reprojection field is strictly wrong there and only exists to feed the history layer.
+    const ModCombo::Ptr m_flat3d_afw_mv_field_mode{
+        ModCombo::create(generate_name("Flat3D_AFW_MVFieldMode"),
+        {
+            "Synthetic eye-jump (field-driven)",
+            "Object-only (plugin reprojects)",
+        }, 0)
+    };
     const ModToggle::Ptr m_flat3d_afw_debug{ ModToggle::create(generate_name("Flat3D_AFW_Debug"), false) }; // log readbacks/diagnostics only
     const ModToggle::Ptr m_flat3d_afw_plugin_debug{ ModToggle::create(generate_name("Flat3D_AFW_PluginDebug"), false) }; // plugin's own debug view (changes rendering)
     // (Synthetic camera-only MV field + CombinedWarping are now ALWAYS ON - validated by burst
@@ -952,6 +968,7 @@ public:
         *m_flat3d_afw_depth_dilation,
         *m_flat3d_afw_obj_motion,
         *m_flat3d_afw_motion_thresh,
+        *m_flat3d_afw_mv_field_mode,
         *m_flat3d_afw_debug,        // persisted so headless tests can drive the debug views via config
         *m_flat3d_afw_plugin_debug,
     };

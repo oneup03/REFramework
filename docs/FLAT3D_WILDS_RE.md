@@ -204,6 +204,35 @@ dereferences garbage and crashes.
   new byte pattern for uniqueness offline before shipping a runtime scan. See its README for the
   full playbook (reflection > string anchor > structure scan > runtime learn > D3D12-level).
 
+### 2.14 Engine-native UI colour+alpha / hudless targets — **INVESTIGATED, PARKED**
+- **Why we looked:** PureDark's own AFW build (PureDark/REFramework@RE9AFW) never captures the GUI —
+  on RE9 it reads the engine's UI buffer straight off the overlay layer via the reflection field
+  `UIBufferTexturePtr` (`layer->get_ui_buffer_tex_d3d12()`) and hands it to the plugin as
+  `InUIColorAlpha`. If Wilds had the same, the whole D3D12 overlay-RT redirect (§2.12) AND the
+  pre/post hudless clones could be replaced by two reflection reads.
+- **What Wilds actually has** (exe string scan + a full TDB probe — `VR::flat3d_probe_engine_ui_targets`,
+  enabled by the AFW debug toggle, logs every type exposing `UIColorAlpha`/`Hudless`/`UITarget`):
+  - REFLECTED (usable): `via.render.layer.Scene::get_UseUIColorAlpha()`,
+    `via.render.DLSSUpscalingInterface::get/set_UseUIColorAlpha()`,
+    `via.render.DLSSFrameGenerationInterface::get/set_UseUIColorAlpha()`,
+    `ace.cFrameGenerationSetting.cDLSS::_UseUIColorAlpha`,
+    `via.render.layer.Overlay::get/set_UseMaskUITarget()`, plus FSR3 `DisableHudless` equivalents.
+  - NOT reflected (native-only, though the names exist in the exe): `get_UIColorAlphaTexPtr`,
+    `getDisplayUIColorAlphaTexPtr`, `getPresentUIColorAlphaTexPtr`, `getDisplayUIColorAlphaSrvPtr`,
+    `preparePresentUIColorAlphaTexture`, `get_HudlessTexPtr`, `getDisplayHudlessTexPtr`,
+    `getNonOCIOHudlessTexPtr` (+ Rtv variants), `getGUIBufferUITarget`.
+- **Live state:** `Scene.UseUIColorAlpha=false`, `Overlay.UseMaskUITarget=false` — on Wilds this is a
+  DLSS frame-generation feature (DLSS-G consumes hudless + UI-alpha), and it is OFF by default.
+- **Verdict:** two blockers, so the redirect stays. (a) The feature must first be switched on, which
+  means reaching a `DLSSUpscalingInterface`/`DLSSFrameGenerationInterface` instance (or the
+  `ace.cFrameGenerationSetting.cDLSS` settings object) — not a managed singleton, so it needs its own
+  derivation. (b) Even then the texture getter is native-only and would need the same treatment as
+  `get_depth_stencil_d3d12` (pattern/offset RE). Revisit if the redirect ever breaks, or if a future
+  Wilds patch reflects the Tex getters.
+- **Cheap re-check after an update:** flip the AFW debug toggle and read `[Flat3D-UIProbe]` in the log;
+  a `Scene.UseUIColorAlpha=true` line (logged once at the overlay hook) means the engine is producing
+  the target and the hunt is worth it.
+
 ## 3. Triage recipe after a Wilds update
 
 1. **Black screen (no crash):** the harvest produced nothing. Most likely §2.4 (`copy_engine` pattern

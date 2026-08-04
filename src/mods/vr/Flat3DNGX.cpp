@@ -48,7 +48,7 @@ cbuffer CorrectParams : register(b0) {
     float2 inv_size;
     float2 delta_to_stored; // uv delta -> stored MV units (render_size / mv_scale)
     float obj_scale;        // object-motion term scale (0 = off)
-    float pad_a;
+    float field_mode;       // 0 = synthetic eye-jump (+object), 1 = OBJECT-ONLY (plugin reprojects)
     float pad_b;
     float pad_c;
 };
@@ -67,11 +67,18 @@ void cs_main(uint3 id : SV_DispatchThreadID) {
     // Homogeneous world point; no /w needed - the scale cancels in the projective division below.
     // Reversed-Z far (d=0) yields a point at infinity, where the eye jump naturally vanishes.
     float4 wp = mul(inv_vp_curr, float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d, 1.0));
-    float4 pt = mul(vp_target, wp);
     float2 mv = float2(0.0, 0.0);
-    if (abs(pt.w) > 1e-8) {
-        float2 uvt = float2(pt.x / pt.w * 0.5 + 0.5, 0.5 - pt.y / pt.w * 0.5);
-        mv = (uvt - uv) * delta_to_stored;
+    // field_mode 1 (OBJECT-ONLY): leave the eye-jump OUT of the field entirely - the plugin
+    // derives the same-tick parallax itself from CameraData + depth (MVType::ObjectOnly, the
+    // decomposition PureDark's own reference build uses). Between the fresh eye and the other eye
+    // at the SAME tick objects have not moved at all, so baking object motion into the
+    // reprojection field (mode 0) is only ever a compromise for the plugin's history layer.
+    if (field_mode < 0.5) {
+        float4 pt = mul(vp_target, wp);
+        if (abs(pt.w) > 1e-8) {
+            float2 uvt = float2(pt.x / pt.w * 0.5 + 0.5, 0.5 - pt.y / pt.w * 0.5);
+            mv = (uvt - uv) * delta_to_stored;
+        }
     }
     // v3 object-motion term (same-frame extraction - no history-texture lookup): THIS frame's raw
     // MV at this pixel minus the camera-only temporal flow (this surface projected into frame
@@ -104,7 +111,7 @@ struct MVCorrectConstants {
     float inv_size[2];
     float delta_to_stored[2];
     float obj_scale{0.0f};
-    float pad_a{0.0f};
+    float field_mode{0.0f};
     float pad_b{0.0f};
     float pad_c{0.0f};
 };
@@ -607,9 +614,21 @@ bool flat3d_ngx_mv_correct_dispatch(ID3D12GraphicsCommandList* cmd, uint32_t eye
     // camera temporal flow vs frame N-1's rendered camera = prev[other], recorded pre-roll) and
     // add it to the eye-jump. The plugin's IgnoreMotionThreshold gates small (foliage) motions.
     const float obj_scale = vr->afw_obj_motion_scale();
+    const bool object_only = vr->afw_mv_field_object_only();
+    c.field_mode = object_only ? 1.0f : 0.0f;
+
     if (obj_scale > 0.0f && afw.prev_frames >= 1) {
         c.vp_prev = vrmod::afw_to_reverse_z(afw.prev_proj[other]) * afw.prev_view[other];
         c.obj_scale = obj_scale;
+    }
+
+    // Object-only with no object term would hand the plugin an empty field; that is a legitimate
+    // A/B (pure CameraData reprojection) but worth flagging once so the log explains the setup.
+    static bool s_mode_logged = false;
+    if (!s_mode_logged) {
+        s_mode_logged = true;
+        spdlog::info("[Flat3D-NGX] MV field mode: {} (obj_scale={:.2f})",
+            object_only ? "OBJECT-ONLY (plugin reprojects from CameraData)" : "synthetic eye-jump", obj_scale);
     }
 
     c.size[0] = afw.io_w;
