@@ -613,22 +613,18 @@ bool flat3d_ngx_mv_correct_dispatch(ID3D12GraphicsCommandList* cmd, uint32_t eye
     // v3 object motion (movers anti-stutter): extract this frame's per-object motion (raw minus
     // camera temporal flow vs frame N-1's rendered camera = prev[other], recorded pre-roll) and
     // add it to the eye-jump. The plugin's IgnoreMotionThreshold gates small (foliage) motions.
+    // OBJECT-ONLY field (settled - user-validated as better): the warp field carries per-object
+    // motion ONLY and the plugin reprojects the same-tick eye parallax itself from CameraData +
+    // depth. Objects have not moved between the two eyes of one tick, so an eye-jump field with
+    // object motion baked in was always a compromise for the plugin's history layer.
+    // (field_mode stays a shader constant: the DLSS same-eye MV feed reuses this same pass with
+    // field_mode 0 to compute its N->N-2 temporal flow.)
     const float obj_scale = vr->afw_obj_motion_scale();
-    const bool object_only = vr->afw_mv_field_object_only();
-    c.field_mode = object_only ? 1.0f : 0.0f;
+    c.field_mode = 1.0f;
 
     if (obj_scale > 0.0f && afw.prev_frames >= 1) {
         c.vp_prev = vrmod::afw_to_reverse_z(afw.prev_proj[other]) * afw.prev_view[other];
         c.obj_scale = obj_scale;
-    }
-
-    // Object-only with no object term would hand the plugin an empty field; that is a legitimate
-    // A/B (pure CameraData reprojection) but worth flagging once so the log explains the setup.
-    static bool s_mode_logged = false;
-    if (!s_mode_logged) {
-        s_mode_logged = true;
-        spdlog::info("[Flat3D-NGX] MV field mode: {} (obj_scale={:.2f})",
-            object_only ? "OBJECT-ONLY (plugin reprojects from CameraData)" : "synthetic eye-jump", obj_scale);
     }
 
     c.size[0] = afw.io_w;
@@ -646,7 +642,7 @@ bool flat3d_ngx_mv_correct_dispatch(ID3D12GraphicsCommandList* cmd, uint32_t eye
     static bool s_logged = false;
     if (!s_logged) {
         s_logged = true;
-        spdlog::info("[Flat3D-NGX] synthetic eye-jump MV field active (present-time compute)");
+        spdlog::info("[Flat3D-NGX] object-only MV field active (plugin reprojects from CameraData)");
     }
 
     return true;

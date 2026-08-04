@@ -5094,8 +5094,7 @@ void VR::draw_flat3d_ui() {
     if (m_flat3d_afw_enabled->value() && m_flat3d_afw.is_available()) {
         m_flat3d_afw_mode->draw("  AFW: warp mode (halo/noise A/B)");
         m_flat3d_afw_depth_dilation->draw("  AFW: depth edge dilation px (silhouette halo fix; 0 = off)");
-        m_flat3d_afw_mv_field_mode->draw("  AFW: MV field mode (object-only = plugin reprojects)");
-        m_flat3d_afw_obj_motion->draw("  AFW: warp object motion (movers anti-stutter; ~1 in object-only mode)");
+        m_flat3d_afw_obj_motion->draw("  AFW: warp object motion (movers anti-stutter; 0 = off)");
         if (m_flat3d_afw_obj_motion->value() > 0.0f) {
             m_flat3d_afw_motion_thresh->draw("  AFW: motion threshold px (foliage gate for object motion)");
         }

@@ -1332,10 +1332,10 @@ void D3D12Component::run_flat3d_afw(VR* vr, uint32_t backbuffer_index) {
     p.IsHudlessColor = !ui_ok || gui_redirect;
     // Synthetic field = displacement from fresh-eye pixels to the other eye (same tick); raw MVs
     // reference the other eye's previous frame. Both match FromOtherEye semantics.
-    // OBJECT-ONLY mode: the field carries per-object motion only and the plugin reprojects the
-    // same-tick eye parallax itself from CameraData + depth (the decomposition PureDark's own
-    // RE9 build uses for its foveated path).
-    p.MotionVectorsType = vr->afw_mv_field_object_only() ? pd::ObjectOnly : pd::FromOtherEye;
+    // Settled OBJECT-ONLY: the field carries per-object motion only and the plugin reprojects the
+    // same-tick eye parallax itself from CameraData + depth (the decomposition PureDark's own RE9
+    // build uses). User-validated as better than the field-driven eye-jump.
+    p.MotionVectorsType = pd::ObjectOnly;
     // NGX gives the exact MV scale (output-pixel space); the user sliders act as multipliers on top.
     // Exact NGX scale - the burst-validated synthetic field needs no user multiplier (the old
     // scale/threshold sliders were raw-MV-era tuning; threshold acts on per-object motion, which
