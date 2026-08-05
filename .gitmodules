@@ -10,3 +10,7 @@
 [submodule "dependencies/glm"]
 	path = dependencies/glm
 	url = https://github.com/g-truc/glm.git
+[submodule "dependencies/SR-lib"]
+	path = dependencies/SR-lib
+	url = https://github.com/bo3b/SR-lib.git
+	branch = api_expansion

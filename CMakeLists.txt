@@ -1451,8 +1451,20 @@ endif()
 # Target: REFramework
 if(REF_BUILD_FRAMEWORK AND CMAKE_SIZEOF_VOID_P EQUAL 8) # build-framework
 	set(CMKR_TARGET REFramework)
-	if(REF_LEIASR AND NOT DEFINED REF_LEIASR_SDK)
-	    set(REF_LEIASR_SDK "${CMAKE_SOURCE_DIR}/../LeiaSR64" CACHE PATH "Path to the LeiaSR (Simulated Reality) SDK root")
+	if(REF_LEIASR)
+	    # SR-lib ships the CMake package for the Simulated Reality SDK: it globs the
+	    # nested SR-SDK-<version>/<arch> tree, names the import libraries directly
+	    # (find_package fails against a submodule that ships .libs without the
+	    # runtime DLLs) and centralises the /DELAYLOAD list. It sets SRLIB_FOUND
+	    # FALSE instead of erroring when the submodule isn't checked out, and the
+	    # leiasr condition gates on that.
+	    add_subdirectory(dependencies/SR-lib)
+	
+    if(NOT SRLIB_FOUND)
+	        message(WARNING "REF_LEIASR is ON but the SR SDK was not found. Run "
+	                        "`git submodule update --init dependencies/SR-lib`. "
+	                        "LeiaSR support is disabled for this build.")
+	    endif()
 	endif()
 
 	set(REFramework_SOURCES
@@ -1610,7 +1622,7 @@ if(REF_BUILD_FRAMEWORK AND CMAKE_SIZEOF_VOID_P EQUAL 8) # build-framework
 		)
 	endif()
 
-	if(REF_LEIASR) # leiasr
+	if(REF_LEIASR AND SRLIB_FOUND) # leiasr
 		target_compile_definitions(REFramework PUBLIC
 			REF_LEIASR
 		)
@@ -1633,31 +1645,13 @@ if(REF_BUILD_FRAMEWORK AND CMAKE_SIZEOF_VOID_P EQUAL 8) # build-framework
 		"${OPENXR_SOURCE_DIR}/src"
 	)
 
-	if(REF_LEIASR) # leiasr
-		target_include_directories(REFramework PUBLIC
-			"${REF_LEIASR_SDK}/include"
-			"${REF_LEIASR_SDK}/third_party/OpenCV/include"
-		)
-	endif()
-
 	target_link_directories(REFramework PUBLIC
 		"dependencies/openvr/lib/win64/"
 	)
 
-	if(REF_LEIASR) # leiasr
-		target_link_directories(REFramework PUBLIC
-			"${REF_LEIASR_SDK}/lib"
-			"${REF_LEIASR_SDK}/third_party/OpenCV/lib/x64"
-		)
-	endif()
-
-	if(REF_LEIASR) # leiasr
+	if(REF_LEIASR AND SRLIB_FOUND) # leiasr
 		target_link_libraries(REFramework PUBLIC
-			simulatedreality
-			SimulatedRealityCore
-			SimulatedRealityDisplays
-			SimulatedRealityDirectX
-			opencv_world343
+			SRLib::SR
 		)
 	endif()
 
@@ -1708,8 +1702,11 @@ if(REF_BUILD_FRAMEWORK AND CMAKE_SIZEOF_VOID_P EQUAL 8) # build-framework
 	    COMMAND ${CMAKE_COMMAND} -E echo "Generating commit hash..."
 	    COMMAND ${CMAKE_COMMAND} -E chdir ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/MakeCommitHash.bat
 	)
-	if(REF_LEIASR)
-	    set_property(TARGET REFramework APPEND_STRING PROPERTY LINK_FLAGS " /DELAYLOAD:simulatedreality.dll /DELAYLOAD:SimulatedRealityCore.dll /DELAYLOAD:SimulatedRealityDisplays.dll /DELAYLOAD:SimulatedRealityDirectX.dll /DELAYLOAD:opencv_world343.dll")
+	if(REF_LEIASR AND SRLIB_FOUND)
+	    # Delay-load every SR runtime DLL the import libs pull into our import table
+	    # (including opencv_world343.dll, the one hand-rolled lists always miss), so
+	    # dinput8.dll still loads on machines without the SR Platform installed.
+	    srlib_apply_delayload(REFramework)
 	endif()
 
 endif()

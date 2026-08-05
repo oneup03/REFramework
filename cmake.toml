@@ -51,17 +51,18 @@ endif()
 DEVELOPER_MODE = { value = true }
 REF_BUILD_FRAMEWORK = { value = true }
 REF_BUILD_DEPENDENCIES = { value = true }
-# Flatscreen 3D: LeiaSR autostereo weaver support. Requires the LeiaSR (Simulated
-# Reality) SDK; set REF_LEIASR_SDK to its root (defaults to ../LeiaSR64 next to
-# the repo). SR DLLs are delay-loaded, so the built DLL still runs without the
-# SR runtime installed.
+# Flatscreen 3D: LeiaSR autostereo weaver support. Builds against the SR-lib
+# submodule (dependencies/SR-lib, api_expansion branch), which vendors the
+# Simulated Reality SDK — run `git submodule update --init dependencies/SR-lib`
+# before enabling this. SR DLLs are delay-loaded, so the built DLL still runs on
+# machines without the SR runtime installed.
 REF_LEIASR = false
 
 [conditions]
 developer-mode-cond = "DEVELOPER_MODE"
 build-framework = "REF_BUILD_FRAMEWORK AND CMAKE_SIZEOF_VOID_P EQUAL 8"
 build-framework-dependencies = "REF_BUILD_DEPENDENCIES AND CMAKE_SIZEOF_VOID_P EQUAL 8"
-leiasr = "REF_LEIASR"
+leiasr = "REF_LEIASR AND SRLIB_FOUND"
 
 [fetch-content.asmjit]
 git = "https://github.com/asmjit/asmjit.git"
@@ -240,11 +241,10 @@ compile-features = ["cxx_std_23"]
 compile-definitions = ["REFRAMEWORK_UNIVERSAL", "REFRAMEWORK_EXPORTS", "CIMGUI_VARGS0"]
 developer-mode-cond.compile-definitions = ["DEVELOPER"]
 leiasr.compile-definitions = ["REF_LEIASR"]
-leiasr.include-directories = ["${REF_LEIASR_SDK}/include", "${REF_LEIASR_SDK}/third_party/OpenCV/include"]
-leiasr.link-directories = ["${REF_LEIASR_SDK}/lib", "${REF_LEIASR_SDK}/third_party/OpenCV/lib/x64"]
-# opencv_world resolves template instantiations leaked by the SR headers; it is
-# delay-loaded and those code paths are never called, so the DLL never loads.
-leiasr.link-libraries = ["simulatedreality", "SimulatedRealityCore", "SimulatedRealityDisplays", "SimulatedRealityDirectX", "opencv_world343"]
+# SRLib::SR carries the SDK include dirs, every import library (opencv_world343
+# included — the SR libs inline cv::String destructors) and SR.cpp's
+# SRInterfaceDX12 wrapper, which owns the SRContext/weaver lifecycle.
+leiasr.link-libraries = ["SRLib::SR"]
 link-libraries = [
     "REFrameworkSDK",
     "utility",
@@ -268,8 +268,20 @@ link-libraries = [
     "pdperfmod"
 ]
 cmake-before="""
-if(REF_LEIASR AND NOT DEFINED REF_LEIASR_SDK)
-    set(REF_LEIASR_SDK "${CMAKE_SOURCE_DIR}/../LeiaSR64" CACHE PATH "Path to the LeiaSR (Simulated Reality) SDK root")
+if(REF_LEIASR)
+    # SR-lib ships the CMake package for the Simulated Reality SDK: it globs the
+    # nested SR-SDK-<version>/<arch> tree, names the import libraries directly
+    # (find_package fails against a submodule that ships .libs without the
+    # runtime DLLs) and centralises the /DELAYLOAD list. It sets SRLIB_FOUND
+    # FALSE instead of erroring when the submodule isn't checked out, and the
+    # leiasr condition gates on that.
+    add_subdirectory(dependencies/SR-lib)
+
+    if(NOT SRLIB_FOUND)
+        message(WARNING "REF_LEIASR is ON but the SR SDK was not found. Run "
+                        "`git submodule update --init dependencies/SR-lib`. "
+                        "LeiaSR support is disabled for this build.")
+    endif()
 endif()
 """
 cmake-after="""
@@ -278,8 +290,11 @@ add_custom_command(
     COMMAND ${CMAKE_COMMAND} -E echo "Generating commit hash..."
     COMMAND ${CMAKE_COMMAND} -E chdir ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/MakeCommitHash.bat
 )
-if(REF_LEIASR)
-    set_property(TARGET REFramework APPEND_STRING PROPERTY LINK_FLAGS " /DELAYLOAD:simulatedreality.dll /DELAYLOAD:SimulatedRealityCore.dll /DELAYLOAD:SimulatedRealityDisplays.dll /DELAYLOAD:SimulatedRealityDirectX.dll /DELAYLOAD:opencv_world343.dll")
+if(REF_LEIASR AND SRLIB_FOUND)
+    # Delay-load every SR runtime DLL the import libs pull into our import table
+    # (including opencv_world343.dll, the one hand-rolled lists always miss), so
+    # dinput8.dll still loads on machines without the SR Platform installed.
+    srlib_apply_delayload(REFramework)
 endif()
 """
 

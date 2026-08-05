@@ -96,7 +96,7 @@ public:
 private:
     void update_srvs(ID3D12Device* device, ID3D12Resource* left, ID3D12Resource* right, ID3D12Resource* pre_left, ID3D12Resource* pre_right);
     D3D12_CPU_DESCRIPTOR_HANDLE update_rtv(ID3D12Device* device, ID3D12Resource* backbuffer, uint32_t index);
-    bool ensure_leia_intermediate(ID3D12Device* device, uint32_t width, uint32_t height);
+    bool ensure_leia_intermediate(ID3D12Device* device, uint32_t sbs_width, uint32_t height);
     void record_compose(ID3D12GraphicsCommandList* cmd_list, D3D12_CPU_DESCRIPTOR_HANDLE rtv, uint32_t width, uint32_t height, const RepackParams& params);
 
     template <typename T> using ComPtr = Microsoft::WRL::ComPtr<T>;
@@ -111,7 +111,7 @@ private:
 
     std::array<d3d12::CommandContext, 3> m_commands{};
 
-    // LeiaSR: SbS intermediate the weaver consumes, plus the weaver itself.
+    // LeiaSR: full-SbS (2W x H) intermediate the weaver consumes, plus the weaver itself.
     d3d12::TextureContext m_leia_intermediate{};
     Flat3DLeiaSR m_leia{};
 

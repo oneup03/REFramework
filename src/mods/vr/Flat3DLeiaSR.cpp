@@ -1,45 +1,16 @@
 #include <spdlog/spdlog.h>
-#include <utility/String.hpp>
 
 #include "Flat3DLeiaSR.hpp"
 
 #ifdef REF_LEIASR
 
-#include <sr/management/srcontext.h>
-#include <sr/weaver/dx12weaver.h>
+#include <exception>
+
+#include <SR.hpp>
 
 namespace vrmod {
-bool Flat3DLeiaSR::available() {
-    if (m_checked_available) {
-        return m_available;
-    }
-
-    m_checked_available = true;
-    m_available = false;
-
-    // Preflight: the SR import libs are /DELAYLOAD'ed, so touching any SR
-    // symbol without the runtime installed would raise a module-not-found
-    // exception. LoadLibraryW resolves through the SR runtime's PATH entry.
-    static const wchar_t* required_dlls[]{
-        L"SimulatedRealityCore.dll",
-        L"SimulatedRealityDisplays.dll",
-        L"SimulatedRealityDirectX.dll",
-        L"simulatedreality.dll",
-    };
-
-    for (const auto dll : required_dlls) {
-        if (LoadLibraryW(dll) == nullptr) {
-            spdlog::info("[Flat3D] LeiaSR runtime not present ({} missing); LeiaSR mode will fall back to SbS", utility::narrow(dll));
-            return false;
-        }
-    }
-
-    m_available = true;
-    return true;
-}
-
 bool Flat3DLeiaSR::init(ID3D12Device* device, HWND window) {
-    if (m_weaver != nullptr) {
+    if (m_sr != nullptr) {
         return true;
     }
 
@@ -47,41 +18,39 @@ bool Flat3DLeiaSR::init(ID3D12Device* device, HWND window) {
         return false; // failed before; don't retry every frame
     }
 
-    if (device == nullptr || window == nullptr || !available()) {
+    if (device == nullptr || window == nullptr) {
         return false;
     }
 
     m_init_attempted = true;
 
-    // The project compiles with /EHa, so catch(...) also covers SEH from the
-    // delay-load thunks and SR service connection failures.
+    // One call replaces what used to be the DLL preflight, SRContext::create,
+    // CreateDX12Weaver and SRContext::initialize here. SR-lib performs them in
+    // the order the SDK requires and probes the delay-loaded SR runtime (core
+    // *and* the DirectX weaver DLL) before touching any SDK entry point, so a
+    // machine without SR Platform installed returns a failed HRESULT rather
+    // than raising SEH out of a delay-load thunk.
+    //
+    // The project compiles with /EHa, so the catch below also covers anything
+    // the SDK throws past SR-lib's own handling.
     try {
-        if (m_context == nullptr) {
-            m_context = SR::SRContext::create();
-        }
+        SimulatedReality::SRInterfaceDX12* sr = nullptr;
+        const auto hr = SimulatedReality::CreateSRInterfaceDX12(device, window, &sr);
 
-        if (m_context == nullptr) {
-            spdlog::error("[Flat3D] SRContext::create failed (is the SR service running?)");
+        if (FAILED(hr) || sr == nullptr) {
+            spdlog::info("[Flat3D] LeiaSR unavailable (CreateSRInterfaceDX12 hr 0x{:08X}); falling back to SbS", (uint32_t)hr);
             return false;
         }
 
-        SR::IDX12Weaver1* weaver = nullptr;
-        const auto err = SR::CreateDX12Weaver(m_context, device, window, &weaver);
+        m_sr = sr;
 
-        if (err != WeaverSuccess || weaver == nullptr) {
-            spdlog::error("[Flat3D] CreateDX12Weaver failed: {}", (int)err);
-            return false;
-        }
+        // Eye textures are plain UNORM (no sRGB views) on both ends, so the
+        // weaver must not convert either direction or it double-applies gamma.
+        m_sr->SetShaderSRGBConversion(false, false);
 
-        m_weaver = weaver;
-
-        // Eye textures are plain UNORM (no sRGB views) on both ends.
-        m_weaver->setShaderSRGBConversion(false, false);
-        m_weaver->setLatencyInFrames(2);
-
-        // Must happen AFTER the weaver exists: starts eye tracking and binds
-        // it to the created weaver(s).
-        m_context->initialize();
+        // SR-lib defaults to 1; we sit a frame deeper behind the game's own
+        // present pipeline.
+        m_sr->SetLatencyInFrames(2);
 
         spdlog::info("[Flat3D] LeiaSR weaver created and SR context initialized");
         return true;
@@ -91,43 +60,38 @@ bool Flat3DLeiaSR::init(ID3D12Device* device, HWND window) {
         spdlog::error("[Flat3D] LeiaSR init failed (unknown/SEH exception)");
     }
 
-    m_weaver = nullptr;
+    m_sr = nullptr;
     return false;
 }
 
-void Flat3DLeiaSR::set_input(ID3D12Resource* sbs_texture, int width, int height, DXGI_FORMAT format) {
-    if (m_weaver == nullptr || sbs_texture == nullptr) {
+void Flat3DLeiaSR::set_input(ID3D12Resource* sbs_texture) {
+    if (m_sr == nullptr || sbs_texture == nullptr) {
         return;
     }
 
-    if (m_last_input == sbs_texture) {
-        return;
-    }
-
+    // Re-bound every frame rather than cached on the pointer: the same resource
+    // can come back with the SDK's internal view invalidated by external state
+    // changes (swapchain resize and friends).
     try {
-        m_weaver->setInputViewTexture(sbs_texture, width, height, format);
-        m_last_input = sbs_texture;
+        m_sr->SetInputTexture(sbs_texture);
     } catch (...) {
-        spdlog::error("[Flat3D] LeiaSR setInputViewTexture failed");
+        spdlog::error("[Flat3D] LeiaSR SetInputTexture failed");
         destroy_weaver();
     }
 }
 
 bool Flat3DLeiaSR::weave(ID3D12GraphicsCommandList* cmd_list, const D3D12_VIEWPORT& viewport, const D3D12_RECT& scissor, DXGI_FORMAT output_format) {
-    if (m_weaver == nullptr || cmd_list == nullptr || m_last_input == nullptr) {
+    if (m_sr == nullptr || cmd_list == nullptr) {
         return false;
     }
 
     try {
         if (m_last_output_format != output_format) {
-            m_weaver->setOutputFormat(output_format);
+            m_sr->SetOutputFormat(output_format);
             m_last_output_format = output_format;
         }
 
-        m_weaver->setCommandList(cmd_list);
-        m_weaver->setViewport(viewport);
-        m_weaver->setScissorRect(scissor);
-        m_weaver->weave();
+        m_sr->Weave(cmd_list, viewport, scissor);
         return true;
     } catch (const std::exception& e) {
         spdlog::error("[Flat3D] LeiaSR weave failed: {}", e.what());
@@ -140,16 +104,18 @@ bool Flat3DLeiaSR::weave(ID3D12GraphicsCommandList* cmd_list, const D3D12_VIEWPO
 }
 
 void Flat3DLeiaSR::destroy_weaver() {
-    if (m_weaver != nullptr) {
+    if (m_sr != nullptr) {
+        // Delete() destroys the weaver and then releases the SRContext once no
+        // other interface is using it. Never `delete` it - the objects live in
+        // the SR DLL and the weaver is an IDestroyable.
         try {
-            m_weaver->destroy();
+            m_sr->Delete();
         } catch (...) {
         }
 
-        m_weaver = nullptr;
+        m_sr = nullptr;
     }
 
-    m_last_input = nullptr;
     m_last_output_format = DXGI_FORMAT_UNKNOWN;
     m_init_attempted = false; // allow re-init (e.g. after device reset)
 }
@@ -158,15 +124,11 @@ void Flat3DLeiaSR::destroy_weaver() {
 #else // !REF_LEIASR
 
 namespace vrmod {
-bool Flat3DLeiaSR::available() {
-    return false;
-}
-
 bool Flat3DLeiaSR::init(ID3D12Device*, HWND) {
     return false;
 }
 
-void Flat3DLeiaSR::set_input(ID3D12Resource*, int, int, DXGI_FORMAT) {
+void Flat3DLeiaSR::set_input(ID3D12Resource*) {
 }
 
 bool Flat3DLeiaSR::weave(ID3D12GraphicsCommandList*, const D3D12_VIEWPORT&, const D3D12_RECT&, DXGI_FORMAT) {

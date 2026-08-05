@@ -389,11 +389,12 @@ void Flat3DCompose::reset() {
 static constexpr D3D12_RESOURCE_STATES LEIA_INTERMEDIATE_STATE =
     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
-bool Flat3DCompose::ensure_leia_intermediate(ID3D12Device* device, uint32_t width, uint32_t height) {
+// sbs_width is the FULL combined side-by-side width (2x the per-eye/backbuffer width).
+bool Flat3DCompose::ensure_leia_intermediate(ID3D12Device* device, uint32_t sbs_width, uint32_t height) {
     if (m_leia_intermediate.texture != nullptr) {
         const auto desc = m_leia_intermediate.texture->GetDesc();
 
-        if (desc.Width == width && desc.Height == height) {
+        if (desc.Width == sbs_width && desc.Height == height) {
             return true;
         }
 
@@ -406,7 +407,7 @@ bool Flat3DCompose::ensure_leia_intermediate(ID3D12Device* device, uint32_t widt
 
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    desc.Width = width;
+    desc.Width = sbs_width;
     desc.Height = height;
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;
@@ -524,10 +525,15 @@ void Flat3DCompose::render(d3d12::TextureContext& left, d3d12::TextureContext& r
     // LeiaSR: compose SbS into an intermediate, then let the weaver interleave
     // it into the backbuffer using live eye tracking. Falls back to plain SbS
     // on the backbuffer whenever the weaver is unavailable.
+    //
+    // The intermediate is FULL side-by-side (2W x H), so each half is a
+    // backbuffer-width eye view and the weaver samples it 1:1 instead of
+    // horizontally upscaling a half-SbS source before the lenticular interleave.
     const auto want_leia = params.mode == MODE_LEIA_SR;
+    const auto sbs_width = width * 2;
     auto leia_active = false;
 
-    if (want_leia && ensure_leia_intermediate(device, width, height)) {
+    if (want_leia && ensure_leia_intermediate(device, sbs_width, height)) {
         leia_active = m_leia.init(device, window);
     }
 
@@ -549,14 +555,15 @@ void Flat3DCompose::render(d3d12::TextureContext& left, d3d12::TextureContext& r
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
         cmd_list->ResourceBarrier(1, &barrier);
 
-        record_compose(cmd_list, m_leia_intermediate.get_rtv(), width, height, params);
+        record_compose(cmd_list, m_leia_intermediate.get_rtv(), sbs_width, height, params);
 
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         barrier.Transition.StateAfter = LEIA_INTERMEDIATE_STATE;
         cmd_list->ResourceBarrier(1, &barrier);
 
-        // 2. Weave intermediate -> backbuffer
-        m_leia.set_input(m_leia_intermediate.texture.Get(), (int)width, (int)height, DXGI_FORMAT_R8G8B8A8_UNORM);
+        // 2. Weave intermediate -> backbuffer. SR-lib reads the dimensions and
+        // format off the resource desc, so there's nothing to describe here.
+        m_leia.set_input(m_leia_intermediate.texture.Get());
 
         barrier.Transition.pResource = backbuffer;
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
@@ -574,6 +581,13 @@ void Flat3DCompose::render(d3d12::TextureContext& left, d3d12::TextureContext& r
         D3D12_RECT scissor{};
         scissor.right = (LONG)width;
         scissor.bottom = (LONG)height;
+
+        // D3D12 rasterizes against whatever RSSetViewports last set ON THE
+        // COMMAND LIST, not against what the weaver is told. The compose above
+        // left it at the 2W-wide intermediate; without this reset the weave
+        // rasterizes at that width and the backbuffer shows only its left half.
+        cmd_list->RSSetViewports(1, &viewport);
+        cmd_list->RSSetScissorRects(1, &scissor);
 
         if (!m_leia.weave(cmd_list, viewport, scissor, m_output_format)) {
             // Weaver died mid-frame: draw plain SbS so the frame isn't lost.
