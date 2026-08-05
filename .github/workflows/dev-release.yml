@@ -45,9 +45,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          submodules: recursive
+          submodules: false
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Fetch submodules
+        shell: bash
+        env:
+          SUBMODULE_PAT: ${{ secrets.SHARED_PAT }}
+        run: |
+          if [ -n "$SUBMODULE_PAT" ]; then
+            # The rewrite must be --global, not --local: `git submodule update`
+            # spawns a separate clone process that never reads this repo's local
+            # config. (persist-credentials: false above means there is no
+            # actions/checkout extraheader to unset here.)
+            git config --global url."https://x-access-token:${SUBMODULE_PAT}@github.com/".insteadOf "https://github.com/"
+          else
+            # No credentials for the private SR-lib. LeiaSR isn't built here
+            # anyway - REF_LEIASR defaults to OFF - so skip that one submodule
+            # instead of failing the checkout.
+            echo "::notice::No SHARED_PAT secret; skipping the private SR-lib submodule (LeiaSR is not built in CI)."
+            git config submodule."dependencies/SR-lib".update none
+          fi
+          git submodule update --init --recursive
 
       - name: Audit direct struct field access
         run: |
