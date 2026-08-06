@@ -711,13 +711,17 @@ public:
             "Alternating/AFR", 
             "Two Frame Sequential", 
             "Single Frame Multipass"
-        }, 
+        },
 #if TDB_VER < 69
         1 // Previous rendering technique
 #else
-        2 // New rendering technique
+        // Flat3D is the primary consumer of this fork and rides AFR (one real camera per frame +
+        // AFW warp of the missing eye); its multipass path renders the cloned second camera
+        // incomplete. Note this also moves the default for HMD VR on TDB>=69, where upstream
+        // preferred multipass - stored configs keep whatever they already have either way.
+        0 // Alternating/AFR
 #endif
-        ) 
+        )
     };
     const ModToggle::Ptr m_use_custom_view_distance{ ModToggle::create(generate_name("UseCustomViewDistance"), false) };
     const ModToggle::Ptr m_hmd_oriented_audio{ ModToggle::create(generate_name("HMDOrientedAudio"), true) };

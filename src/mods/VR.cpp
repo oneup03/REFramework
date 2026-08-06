@@ -2738,6 +2738,23 @@ void VR::disable_bad_effects() {
     // than NONE so edges/foliage still get anti-aliased.
     const auto flat3d_no_temporal = is_using_flat3d() && !is_using_multipass();
 
+    // On MHWilds set_AntiAliasing does NOT stick - the game re-derives AA from its own graphics
+    // options, so get_AntiAliasing still reports FXAA_TAA on the very next frame. That turned this
+    // block into a per-frame "change the AA mode" storm the moment AFR/sequential armed
+    // flat3d_no_temporal, and an AA change makes the engine rebuild its post-effect resources.
+    // Doing that every frame from this hook crashed the game one frame after the switch
+    // (c0000005, null deref inside the following RenderConfig call - see the multipass->AFR
+    // crash log). Bound the flat3d attempts; if the game insists, leave its AA alone and say so.
+    // The VR force-AA path is untouched: where the setter sticks, the retry never happens anyway.
+    constexpr uint32_t k_max_flat3d_aa_attempts = 1;
+    static uint32_t s_flat3d_aa_attempts = 0;
+    static bool s_flat3d_aa_armed = false;
+
+    if (flat3d_no_temporal != s_flat3d_aa_armed) {
+        s_flat3d_aa_armed = flat3d_no_temporal;
+        s_flat3d_aa_attempts = 0; // re-arm on every technique change
+    }
+
     if ((m_force_aa_settings->value() || flat3d_no_temporal) && get_antialiasing_method != nullptr && set_antialiasing_method != nullptr) {
         const auto antialiasing = get_antialiasing_method->call<via::render::RenderConfig::AntiAliasingType>(context, render_config);
         const auto target_aa = flat3d_no_temporal
@@ -2757,6 +2774,23 @@ void VR::disable_bad_effects() {
         switch (antialiasing) {
             case via::render::RenderConfig::AntiAliasingType::TAA: [[fallthrough]];
             case via::render::RenderConfig::AntiAliasingType::FXAA_TAA:
+                if (flat3d_no_temporal && s_flat3d_aa_attempts >= k_max_flat3d_aa_attempts) {
+                    static bool s_warned = false;
+
+                    if (!s_warned) {
+                        s_warned = true;
+                        spdlog::warn("[Flat3D] the game keeps re-applying temporal AA; giving up rather than "
+                            "fighting it every frame. Set Anti-Aliasing to SMAA/FXAA/None in the game's "
+                            "graphics options - TAA smears badly in AFR.");
+                    }
+
+                    break;
+                }
+
+                if (flat3d_no_temporal) {
+                    ++s_flat3d_aa_attempts;
+                }
+
                 set_antialiasing_method->call<void*>(context, render_config, target_aa);
                 spdlog::info("[VR] Temporal AA replaced with {}", flat3d_no_temporal ? "SMAA (flat3d)" : "NONE");
                 break;
