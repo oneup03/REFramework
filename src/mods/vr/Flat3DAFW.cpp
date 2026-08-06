@@ -178,4 +178,49 @@ bool Flat3DAFW::ensure_eye_buffers(uint32_t width, uint32_t height, DXGI_FORMAT 
 
     return m_eye_buffers_ready;
 }
+
+void Flat3DAFW::on_device_reset() {
+    if (m_renderer == nullptr) {
+        return; // never initialized - nothing cached
+    }
+
+    // Clearing the ready flags is what actually forces the rebuild: every ensure_* guard is
+    // `ready && signature matches`, and a reset at an unchanged resolution matches the signature.
+    // The size/format caches are zeroed too so the comparison can't accidentally pass later.
+    io_ready = false;
+    ui_ready = false;
+    m_eye_buffers_ready = false;
+    m_last_w = 0;
+    m_last_h = 0;
+    m_last_eye_fmt = DXGI_FORMAT_UNKNOWN;
+    m_last_bb_fmt = DXGI_FORMAT_UNKNOWN;
+    io_w = 0;
+    io_h = 0;
+    io_mv_fmt = DXGI_FORMAT_UNKNOWN;
+
+    // Null the descs rather than leaving dangling pTextures: the present path tests them directly
+    // (e.g. `afw.io_depth[fresh].pTexture != nullptr`) and would otherwise hand the plugin
+    // pointers into resources that died with the old swapchain.
+    io_depth[0] = pd::TextureDesc{};
+    io_depth[1] = pd::TextureDesc{};
+    io_depth_dil = pd::TextureDesc{};
+    io_mv[0] = pd::TextureDesc{};
+    io_mv[1] = pd::TextureDesc{};
+    io_mv_corr[0] = pd::TextureDesc{};
+    io_mv_corr[1] = pd::TextureDesc{};
+    io_mv_dlss[0] = pd::TextureDesc{};
+    io_mv_dlss[1] = pd::TextureDesc{};
+    io_hudless = pd::TextureDesc{};
+    io_final = pd::TextureDesc{};
+    io_ui[0] = pd::TextureDesc{};
+    io_ui[1] = pd::TextureDesc{};
+    m_eye_buffers = pd::EyeFrameBuffers{};
+
+    // The camera history and the NGX harvest both describe frames from before the reset; feeding
+    // them to the warp would reproject against a discontinuity.
+    prev_frames = 0;
+    ngx_last_frame = -1000;
+
+    spdlog::info("[Flat3D-AFW] device reset - dropped io/ui/eye buffers, rebuilding next frame");
+}
 } // namespace vrmod

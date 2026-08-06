@@ -88,6 +88,15 @@ public:
         }
     }
 
+    // A device reset (swapchain recreate / device loss) invalidates every resource the plugin
+    // allocated for us, but each ensure_* above short-circuits purely on size+format - so at an
+    // unchanged resolution NOTHING got rebuilt and AFW kept running against the dead swapchain's
+    // buffers while the rest of the pipeline was recreated around it. Drop the caches so the next
+    // frame reallocates. The plugin's renderer itself is deliberately NOT re-created: InitDevice is
+    // a one-shot with no teardown entry point (uevr-3d guards it the same way), so it stays bound
+    // to the device it was given.
+    void on_device_reset();
+
 private:
     bool m_attempted{false};
     const char* m_status{"not attempted"};

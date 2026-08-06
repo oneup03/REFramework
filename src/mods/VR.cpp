@@ -5207,6 +5207,12 @@ void VR::on_device_reset() {
 
     m_flat3d_depth_sampler.reset();
 
+    // AFW owns plugin-side resources (io depth/MV, UI, per-eye framebuffers) that are bound to the
+    // swapchain being torn down. Without this it was the only subsystem left un-reset: its ensure_*
+    // guards key on size+format, so after a reset at the same resolution nothing rebuilt and the
+    // warp kept running against dead buffers.
+    m_flat3d_afw.on_device_reset();
+
     spdlog::info("VR: on_device_reset");
     m_backbuffer_inconsistency = false;
     if (g_framework->is_dx11()) {
