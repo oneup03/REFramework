@@ -61,10 +61,10 @@ jobs:
             # actions/checkout extraheader to unset here.)
             git config --global url."https://x-access-token:${SUBMODULE_PAT}@github.com/".insteadOf "https://github.com/"
           else
-            # No credentials for the private SR-lib. LeiaSR isn't built here
-            # anyway - REF_LEIASR defaults to OFF - so skip that one submodule
-            # instead of failing the checkout.
-            echo "::notice::No SHARED_PAT secret; skipping the private SR-lib submodule (LeiaSR is not built in CI)."
+            # No credentials for the private SR-lib. Skip that one submodule
+            # instead of failing the checkout: REF_LEIASR is gated on
+            # SRLIB_FOUND, so the build still succeeds - just without the weaver.
+            echo "::notice::No SHARED_PAT secret; skipping the private SR-lib submodule (this build will have no LeiaSR support)."
             git config submodule."dependencies/SR-lib".update none
           fi
           git submodule update --init --recursive
@@ -74,8 +74,10 @@ jobs:
           pip install libclang
           python dev/audit_direct_access_clang.py
 
+      # REF_LEIASR is gated on SRLIB_FOUND, so this is a no-op (with a warning) on any
+      # run where the private SR-lib submodule was skipped for lack of credentials.
       - name: Configure CMake
-        run: cmake -S ${{github.workspace}} -B ${{github.workspace}}/build -G "Visual Studio 18 2026" -A x64 -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DDEVELOPER_MODE=ON "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+        run: cmake -S ${{github.workspace}} -B ${{github.workspace}}/build -G "Visual Studio 18 2026" -A x64 -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DDEVELOPER_MODE=ON -DREF_LEIASR=ON "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
 
       - name: Build
         run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --target REFramework
