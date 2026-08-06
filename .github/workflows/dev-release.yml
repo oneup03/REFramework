@@ -82,11 +82,34 @@ jobs:
       - name: Build
         run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --target REFramework
 
+      # Flat3D's AFW needs PureDark's PDAFWPlugin.dll sitting next to the game exe. Without it
+      # Flat3DAFW::init bails, and because is_using_flat3d_afw() gates them, the AFW warp, the
+      # GUI-depth compositing AND the DLSS depth harvest that feeds auto-convergence / the dynamic
+      # crosshair all silently do nothing. Ship it in the zip so it lands beside dinput8.dll.
+      # Deliberately hard-fails rather than shipping a quietly incomplete zip - a silently missing
+      # plugin is exactly what made those features look broken. Mirrors uevr-3d's dev-release step.
+      - name: Bundle PDAFWPlugin from PureDark AFW release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: powershell
+        run: |
+          $afwDir = "${{github.workspace}}/afw-plugin"
+          New-Item -ItemType Directory -Force -Path $afwDir | Out-Null
+          gh release download --repo PureDark/UEVR --pattern "*joeyhodge*" --dir $afwDir
+          $zip = Get-ChildItem $afwDir -Filter *.zip | Select-Object -First 1
+          if (-not $zip) { throw "No 'joeyhodge' zip asset found in the latest PureDark/UEVR release" }
+          Expand-Archive -Path $zip.FullName -DestinationPath "$afwDir/extracted" -Force
+          $dll = Get-ChildItem "$afwDir/extracted" -Recurse -Filter PDAFWPlugin.dll | Select-Object -First 1
+          if (-not $dll) { throw "PDAFWPlugin.dll not found inside $($zip.Name)" }
+          Copy-Item -Force $dll.FullName "${{github.workspace}}/PDAFWPlugin.dll"
+          Write-Host "Bundled PDAFWPlugin.dll from $($zip.Name)"
+
       - name: Compress REFramework
         run: |
           echo ${{github.sha}} > ${{github.workspace}}/reframework_revision.txt
           7z a ${{github.workspace}}/REFramework.zip ${{github.workspace}}/reframework_revision.txt
           7z a ${{github.workspace}}/REFramework.zip ${{github.workspace}}/build/bin/REFramework/dinput8.dll
+          7z a ${{github.workspace}}/REFramework.zip ${{github.workspace}}/PDAFWPlugin.dll
 
       - name: Compress VR prerequisites
         run: |
