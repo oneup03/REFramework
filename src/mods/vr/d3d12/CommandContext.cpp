@@ -15,6 +15,23 @@ bool CommandContext::setup(const wchar_t* name) {
     auto& hook = g_framework->get_d3d12_hook();
     auto device = hook->get_device();
 
+    // Re-creating the fence orphans anything still in flight: the old fence - the only object
+    // carrying the SetEventOnCompletion registration - dies here, so the fresh event below can
+    // never be signaled. Leaving waiting_for_fence set would make the next wait(INFINITE) block
+    // forever (hard game freeze). Drain what we can, then clear the wait state.
+    if (this->fence_event != nullptr) {
+        if (this->waiting_for_fence) {
+            WaitForSingleObject(this->fence_event, 2000);
+        }
+
+        CloseHandle(this->fence_event);
+        this->fence_event = nullptr;
+    }
+
+    this->waiting_for_fence = false;
+    this->has_commands = false;
+    this->fence_value = 0;
+
     this->cmd_allocator.Reset();
     this->cmd_list.Reset();
     this->fence.Reset();
