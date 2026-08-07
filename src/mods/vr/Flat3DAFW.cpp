@@ -221,6 +221,10 @@ void Flat3DAFW::on_device_reset() {
     prev_frames = 0;
     ngx_last_frame = -1000;
 
+    // Signals run_flat3d_afw's own static TextureDesc caches (plugin-created depth/MV and the
+    // wrapped color/hudless/post descs) to rebuild - they cannot detect the reset themselves.
+    ++reset_epoch;
+
     spdlog::info("[Flat3D-AFW] device reset - dropped io/ui/eye buffers, rebuilding next frame");
 }
 } // namespace vrmod

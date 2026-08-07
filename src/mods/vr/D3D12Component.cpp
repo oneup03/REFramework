@@ -984,6 +984,34 @@ void D3D12Component::run_flat3d_afw(VR* vr, uint32_t backbuffer_index) {
     static std::array<pd::TextureDesc, 2> s_color_desc{}; // per eye slot
     static pd::TextureDesc s_depth_desc{};
     static pd::TextureDesc s_mv_desc{};
+    // Declared here (not at their use sites) so the epoch check below can invalidate every one of
+    // them before anything reads them this frame.
+    static pd::TextureDesc s_pdepth{};
+    static pd::TextureDesc s_pmv{};
+    static uint64_t s_dims = 0;
+    static pd::TextureDesc s_hudless_src{};
+    static pd::TextureDesc s_post_src{};
+
+    // A device reset destroys everything these caches point at, and none of their own guards can
+    // tell: `wrap` compares pointer identity, the plugin depth/MV block compares s_dims plus a
+    // non-null check, and at an unchanged resolution all of those still pass while the resources
+    // are dead. Flat3DAFW bumps reset_epoch on every reset - drop the caches when it moves so they
+    // are rebuilt instead of copied into. (Without this, Flat3DAFW::on_device_reset would leave the
+    // warp in the WORST state: freshly rebuilt class-owned buffers feeding stale plugin textures.)
+    static uint32_t s_epoch = 0;
+
+    if (s_epoch != afw.reset_epoch) {
+        s_epoch = afw.reset_epoch;
+        s_color_desc = {};
+        s_depth_desc = pd::TextureDesc{};
+        s_mv_desc = pd::TextureDesc{};
+        s_pdepth = pd::TextureDesc{};
+        s_pmv = pd::TextureDesc{};
+        s_dims = 0;
+        s_hudless_src = pd::TextureDesc{};
+        s_post_src = pd::TextureDesc{};
+        spdlog::info("[Flat3D-AFW] device reset - dropped cached plugin texture descs");
+    }
 
     auto wrap = [&](pd::TextureDesc& desc, ID3D12Resource* res, pd::ImageType type, D3D12_RESOURCE_STATES state) {
         if (desc.pTexture != res) {
@@ -1003,12 +1031,9 @@ void D3D12Component::run_flat3d_afw(VR* vr, uint32_t backbuffer_index) {
     // externally-wrapped SetupTextureDesc resources are used as copy sources only - handing them to
     // the warp made it sample null descriptors = zero depth = mono copy). Create plugin-side
     // depth/MV and copy our snapshots into them each frame.
-    static pd::TextureDesc s_pdepth{};
-    static pd::TextureDesc s_pmv{};
     {
         const auto dd = m_afw_depth_local->GetDesc();
         const auto md = m_afw_mv_local->GetDesc();
-        static uint64_t s_dims = 0;
         const uint64_t dims = dd.Width ^ ((uint64_t)dd.Height << 20) ^ ((uint64_t)md.Format << 44);
         if (dims != s_dims || s_pdepth.pTexture == nullptr || s_pmv.pTexture == nullptr) {
             s_dims = dims;
@@ -1044,14 +1069,12 @@ void D3D12Component::run_flat3d_afw(VR* vr, uint32_t backbuffer_index) {
         ui_ok = m_flat3d_pre_left_cache.texture != nullptr && m_flat3d_pre_right_cache.texture != nullptr
             && afw.ensure_ui_textures(content_w, content_h, cache_desc.Format);
     }
-    static pd::TextureDesc s_hudless_src{};
     if (ui_ok && s_hudless_src.pTexture != m_flat3d_pre_left_cache.texture.Get()) {
         s_hudless_src = pd::TextureDesc{};
         s_hudless_src.pTexture = m_flat3d_pre_left_cache.texture.Get();
         s_hudless_src.initialState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         renderer->SetupTextureDesc(s_hudless_src);
     }
-    static pd::TextureDesc s_post_src{};
     if (ui_ok && s_post_src.pTexture != m_flat3d_pre_right_cache.texture.Get()) {
         s_post_src = pd::TextureDesc{};
         s_post_src.pTexture = m_flat3d_pre_right_cache.texture.Get();

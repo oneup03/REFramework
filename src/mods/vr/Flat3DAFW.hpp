@@ -97,6 +97,11 @@ public:
     // to the device it was given.
     void on_device_reset();
 
+    // Bumped by every on_device_reset. Callers that cache plugin TextureDescs in their own statics
+    // (run_flat3d_afw) compare against this to know their caches died with the old swapchain -
+    // pointer-identity and size checks cannot detect that on their own.
+    uint32_t reset_epoch{0};
+
 private:
     bool m_attempted{false};
     const char* m_status{"not attempted"};
