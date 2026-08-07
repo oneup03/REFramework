@@ -2,6 +2,8 @@
 
 #include "utility/FunctionHook.hpp"
 
+#include "REFramework.hpp"
+
 #include "Flat3DGuiRedirect.hpp"
 
 namespace vrmod {
@@ -149,6 +151,33 @@ void Flat3DGuiRedirect::on_reset() {
 void Flat3DGuiRedirect::ensure_gui_texture(ID3D12Resource* overlay_target) {
     const auto src_desc = overlay_target->GetDesc();
     const auto fmt = typed_format(src_desc.Format);
+
+    // The overlay layer also runs for small offscreen renders (item/monster preview targets and
+    // the like). Adopting one is destructive: a 320x320 R11G11B10_FLOAT target turned up
+    // mid-session, tore down the real 3840x2160 capture and rebuilt it at icon size, after which
+    // the compose sampled a 320x320 HDR texture as the entire HUD layer - and the GUI draws we
+    // substitute got a render target far smaller than the viewport bound with it. Only the
+    // full-frame target carries the HUD. Half the backbuffer is the threshold rather than an exact
+    // match, so the engine's sub-region rendering under the native-output override still passes.
+    if (auto& hook = g_framework->get_d3d12_hook(); hook != nullptr) {
+        if (auto* swapchain = hook->get_swap_chain(); swapchain != nullptr) {
+            DXGI_SWAP_CHAIN_DESC sd{};
+
+            if (SUCCEEDED(swapchain->GetDesc(&sd)) && sd.BufferDesc.Width != 0 && sd.BufferDesc.Height != 0
+                    && (src_desc.Width * 2 < sd.BufferDesc.Width || src_desc.Height * 2 < sd.BufferDesc.Height)) {
+                static uint32_t s_rejected = 0;
+
+                if ((s_rejected++ % 600) == 0) {
+                    spdlog::info("[Flat3D-GUIR] ignoring {}x{} fmt {} overlay target (backbuffer {}x{}) - "
+                        "not the full-frame HUD target [x{}]",
+                        (uint32_t)src_desc.Width, src_desc.Height, (int)fmt,
+                        sd.BufferDesc.Width, sd.BufferDesc.Height, s_rejected);
+                }
+
+                return;
+            }
+        }
+    }
 
     if (m_gui_tex[0] != nullptr && m_gui_tex[1] != nullptr
         && m_gui_w == (uint32_t)src_desc.Width && m_gui_h == src_desc.Height && m_gui_format == fmt) {
