@@ -255,3 +255,41 @@ Tile-mapping (§2.8), the compose/present pass (pure D3D12 + runtime-compiled HL
 every reflection-based access (scene layers, camera duplicator, `get_target_state`, `set_output_state`,
 `get_output_state_offset` which itself scans for the `via.render.TargetState` typeinfo). These ride on
 praydog's SDK, which is maintained per game version upstream.
+
+---
+
+## 5. Verification log
+
+### 2026-09-04 — game build 2026-08-18 (`MonsterHunterWilds.exe`, 539,469,728 bytes)
+
+Re-validated statically against the updated exe with `tools/wilds_re/` (no game launch). **Every
+statically-checkable T2 pattern and T3 offset is intact — no re-derivation was needed.** Absolute
+addresses moved (as always); the patterns still resolve.
+
+| § | Item | Tier | Result |
+|---|---|---|---|
+| 2.1 | `RenderResource` runtime size | T3 | ✅ embedded TDB header still reports **version 81**, so the `v >= 81` padding gate is still correct |
+| 2.2 | `create_texture` debug-string anchor | T2 | ✅ string present, **exactly 1** occurrence, **1** code xref |
+| 2.2 | `create_texture` 4-arg convention | T3-ish | ✅ enclosing fn `0x14aa20190`, size **0x2310** (unchanged); prologue still shuffles `rcx`→out, `rdx`→device, `r8`→desc, `r9d`→dim, and reads a 5th stack arg |
+| 2.3 | `resolve_texture_memory_device` pattern | T2 | ✅ **unique** match @ `0x14ae8817a` (the `0x45950` singleton size is unchanged) |
+| 2.3 | device offset `+0x18` | T3 | ⚠️ runtime-only (`create_texture(Wilds): device=<nonzero> ok=1`) |
+| 2.4 | `copy_engine` builder pattern | T2 | ✅ **unique** match @ `0x1400455e0` |
+| 2.6 | state tracker `tex+0x100`, `0x30` stride | T3 ⚠️ | ✅ confirmed in fn `0x14021d180` @ `0x14021f983`: `mov rdx,[rdi+0x100]` … `add rax,0x30`, looped against a count at `+0x120` |
+| 2.6 | resolve gate `tex+0x158` | T3 ⚠️ | ✅ confirmed @ `0x14021dbda`: `cmp byte [rbp+0x158],0` / `je` → direct path |
+| 2.6 | alias registry `tex+0x150`, native `tex+0xf0`→`+0x20` | T3 | ✅ confirmed @ `0x14021dbe7`–`0x14021dbfb` on the gate's nonzero branch |
+| 2.7 | native-resource offset | T1 | ✅ reflection-derived, cannot go stale |
+| 2.8 | `back_reserved_texture` | T1 | ✅ pure D3D12 |
+| 2.10 | GUI-camera projection hook | T2 | ⚠️ runtime-only — the 3 patterns are searched *inside* a reflection-resolved function, so they cannot be checked offline. Confirm via the `Hooked via.gui.GUICamera.get_ProjectionMatrix` log |
+| 2.11 | NGX depth/MV harvest | T1-ish | ⚠️ runtime-only — resolved from `nvngx` **exports**, not game patterns |
+| 2.12 | Overlay-RT GUI redirect | T0 | ✅ no game constants at all |
+
+**Reproduce this audit:** the checks are ~40 lines against `tools/wilds_re/re_wilds.py` +
+`funcs.py` — regex the pattern bytes over the executable sections and assert a unique hit; for
+§2.6, scan for `48 8B [80-BF] 00 01 00 00` (a `[reg+0x100]` qword load) and a `[reg+0x158]` byte
+access, intersect by enclosing function via `Funcs.func_of`, then disassemble the survivors and
+look for the `0x30` stride and the `je`-to-direct-path gate. The TDB version comes from the
+`'TDB\0'` magic in the exe followed by a `uint32` version.
+
+**Still runtime-only** (four rows above): launch once and grep the log for
+`create_texture(Wilds): ok=1`, `Hooked via.gui.GUICamera.get_ProjectionMatrix`,
+`back_reserved_texture: mapped`, and `[Flat3D-GUIR] per-eye gui textures created`.
