@@ -74,8 +74,19 @@ public:
         // Redirect-GUI horizontal fit-squish about center (<= 1): shrinks the GUI so the
         // per-eye plane shift can't clip its sides (dynamic3d "fit" strategy). 1 = off.
         float ui_fit_scale{1.0f};
+        // Ghost/crosstalk reduction (output3d 3.4), applied last in the shader. Exact no-ops at
+        // these defaults, and the shader branches on them so the untouched path stays bit-exact.
+        float ghost_contrast{1.0f};    // < 1 squeezes toward mid-grey, shrinking |L-R|
+        float ghost_black_floor{0.0f}; // > 0 raises the black floor ("foot-room" for cancellation)
         float cpad1{0.0f};
+        float cpad2{0.0f};
+        float cpad3{0.0f};
     };
+
+    // Root constants are written as a raw dword blob, so the C++ struct and the HLSL cbuffer must
+    // agree field-for-field. HLSL rounds a cbuffer up to a 16-byte multiple - keep the explicit
+    // tail padding above in step with that so no field silently shifts register.
+    static_assert(sizeof(RepackParams) == 128, "RepackParams must stay a 16-byte multiple and match the shader cbuffer");
 
     bool setup(ID3D12Device* device, DXGI_FORMAT output_format);
     void reset();

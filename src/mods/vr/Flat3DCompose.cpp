@@ -38,8 +38,12 @@ cbuffer RepackParams : register(b0) {
     float ui_disp_bias;
     float content_frac_u;  // native-output override: engine content occupies this top-left fraction
     float content_frac_v;  // of the (forced-native) eye textures; (1,1) = full frame
-    float ui_fit_scale; // redirect-GUI horizontal fit-squish about center (<= 1); 1 = off
+    float ui_fit_scale;      // redirect-GUI horizontal fit-squish about center (<= 1); 1 = off
+    float ghost_contrast;    // ghost/crosstalk reduction: 1 = off
+    float ghost_black_floor; // ghost/crosstalk reduction: 0 = off
     float cpad1;
+    float cpad2;
+    float cpad3;
 };
 
 Texture2D eye_left : register(t0);
@@ -163,12 +167,45 @@ float4 Anaglyph(int m, float4 cA, float4 cB) {
     return float4(cA.r, cA.g, dot(cB.rgb, float3(0.15, 0.30, 0.55)), 1.0);
 }
 
+// Ghost/crosstalk reduction (output3d 3.4). Every stereo display leaks some of each eye into the
+// other, and how visible that leak is depends on the brightness DIFFERENCE between the eyes - so
+// compressing the signal range before it reaches the display reduces what you see. Displays that
+// CANCEL crosstalk (autostereo panels, the LeiaSR weaver) additionally pre-subtract a fraction of
+// the fellow eye, which drives values below zero where the render target clamps them; the clamped
+// part is exactly what survives as a ghost, and raising the black floor gives that subtraction the
+// foot-room it needs.
+//
+// Deliberately GLOBAL and FIXED. Localizing it cannot work (ghosting IS inter-eye difference, so a
+// correction applied unevenly manufactures more of it), and adapting it per frame is visibly worse
+// than a slightly-wrong constant - the whole image pumps as content changes.
+//
+// The remap runs in LINEAR light, pivoting on 0.5 via a plain 2.2 gamma, because that is the space
+// a cancelling display's own correction runs in - the two have to agree or this makes things worse.
+float3 GhostReduce(float3 c) {
+    if (ghost_contrast >= 1.0 && ghost_black_floor <= 0.0) {
+        return c; // exact no-op at the defaults; keep the untouched path bit-exact
+    }
+
+    float3 lin = pow(saturate(c), 2.2);
+    lin = (lin - 0.5) * ghost_contrast + 0.5;                    // squeeze toward mid-grey
+    lin = lin * (1.0 - ghost_black_floor) + ghost_black_floor;   // raise the black floor
+    return pow(saturate(lin), 1.0 / 2.2);
+}
+
+// Applied at every one of ps_main's returns, so it lands on the FINAL composed pixel in every
+// mode - last, after all other colour work, which is what output3d 3.4 requires. It sits here
+// rather than around a single Repack() call because fxc's flow analysis emits a spurious
+// "potentially uninitialized" X4000 for any non-entry function that returns from inside an if.
+float4 GhostOut(float4 c) {
+    return float4(GhostReduce(c.rgb), c.a);
+}
+
 float4 ps_main(VSOut input) : SV_Target {
     float2 uv = input.uv;
     float2 pix = input.pos.xy;
 
-    if (mode == 100) { return SampleEye(0, uv.x, uv.y); } // debug: left only
-    if (mode == 101) { return SampleEye(1, uv.x, uv.y); } // debug: right only
+    if (mode == 100) { return GhostOut(SampleEye(0, uv.x, uv.y)); } // debug: left only
+    if (mode == 101) { return GhostOut(SampleEye(1, uv.x, uv.y)); } // debug: right only
 
     if (mode == 0 || mode == 5) { // SbS (LeiaSR consumes an SbS compose)
         int half_idx = (uv.x < 0.5) ? 0 : 1;
@@ -201,25 +238,25 @@ float4 ps_main(VSOut input) : SV_Target {
             float3 sceneBase = (half_idx == 0) ? eye_pre_left.Sample(samp, baseUV).rgb
                                                : eye_pre_right.Sample(samp, baseUV).rgb;
 
-            return float4(lerp(sceneBase, gpost, m), 1.0);
+            return GhostOut(float4(lerp(sceneBase, gpost, m), 1.0));
         }
 
-        return SampleEye(half_idx, u_half, uv.y);
+        return GhostOut(SampleEye(half_idx, u_half, uv.y));
     }
 
     if (mode == 1) { // TaB
-        if (uv.y < 0.5) { return SampleEye(0, uv.x, uv.y * 2.0); }
-        return SampleEye(1, uv.x, (uv.y - 0.5) * 2.0);
+        if (uv.y < 0.5) { return GhostOut(SampleEye(0, uv.x, uv.y * 2.0)); }
+        return GhostOut(SampleEye(1, uv.x, (uv.y - 0.5) * 2.0));
     }
 
     // Pattern from the OUTPUT pixel coordinate, after the (possibly
     // upscaling) sample above - display-pixel-exact at any render resolution.
-    if (mode == 2) { return SampleEye(((int)pix.y) & 1, uv.x, uv.y); }              // row interlaced
-    if (mode == 3) { return SampleEye(((int)pix.x) & 1, uv.x, uv.y); }              // column interlaced
-    if (mode == 4) { return SampleEye(((int)pix.x + (int)pix.y) & 1, uv.x, uv.y); } // checkerboard
+    if (mode == 2) { return GhostOut(SampleEye(((int)pix.y) & 1, uv.x, uv.y)); }              // row interlaced
+    if (mode == 3) { return GhostOut(SampleEye(((int)pix.x) & 1, uv.x, uv.y)); }              // column interlaced
+    if (mode == 4) { return GhostOut(SampleEye(((int)pix.x + (int)pix.y) & 1, uv.x, uv.y)); } // checkerboard
 
     // Anaglyph family: every variant samples both full eyes.
-    return Anaglyph(mode, SampleEye(0, uv.x, uv.y), SampleEye(1, uv.x, uv.y));
+    return GhostOut(Anaglyph(mode, SampleEye(0, uv.x, uv.y), SampleEye(1, uv.x, uv.y)));
 }
 )";
 

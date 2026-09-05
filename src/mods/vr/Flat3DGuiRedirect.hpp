@@ -52,6 +52,35 @@ public:
 
     bool is_armed() const { return m_armed.load(std::memory_order_acquire); }
 
+    // True once the overlay layer has gone this long without presenting a full-frame HUD target -
+    // i.e. the engine is on a full-screen UI screen (quest rewards, and anything else that parks
+    // the world and draws only UI). Two things must change there:
+    //   - the scene's symmetric-projection shift + cover-zoom must go to identity, or the UI (which
+    //     the engine baked into the scene target, since the redirect has nothing to capture) gets
+    //     overscanned by 1 + separation - invisible on a 3D scene, glaring on a flat 2D panel;
+    //   - the AFW warp must be bypassed: the geometry is frozen, so depth/MV are stale/degenerate
+    //     and warping the missing eye from them mangles it differently every frame (the flicker).
+    // Exits immediately on the next full-frame arm.
+    static bool is_full_frame_target(ID3D12Resource* target);
+
+    // Call once per present. Ages the "when did a GUI window last complete" counter.
+    void tick();
+
+    // A capture is only usable while windows keep completing. The quest-rewards screen starves
+    // them outright, and painting a capture nobody refreshes any more is what put a dead GUI layer
+    // over the screen (with the fit-scale margins letting the stale scene show at the left/right
+    // edges). Gate the whole GUI composite on this.
+    bool capture_is_fresh() const { return m_frames_since_capture.load(std::memory_order_acquire) < CAPTURE_STALE_FRAMES; }
+
+    // Either signal means the redirect cannot do its job right now: the overlay layer is not
+    // presenting a full-frame HUD target, or no window has completed recently. Whichever it is,
+    // the UI has ended up in the engine's own target (the scene texture), so the scene's shift +
+    // cover-zoom must go to identity (or the UI is overscanned by 1 + separation) and the AFW warp
+    // must be bypassed (frozen geometry -> stale/degenerate depth+MV -> per-frame flicker).
+    bool is_ui_screen() const {
+        return m_idle_frames.load(std::memory_order_acquire) >= UI_SCREEN_IDLE_FRAMES || !capture_is_fresh();
+    }
+
     // The captured GUI texture for an eye (premultiplied-on-transparent content,
     // PIXEL_SHADER_RESOURCE state after its frame's marker B). Null until that eye's first
     // capture completes (callers fall back to the other eye's texture).
@@ -96,6 +125,24 @@ private:
     uint32_t m_gui_w{0};
     uint32_t m_gui_h{0};
     uint32_t m_rtv_increment{0};
+
+    // Anti-thrash for the overlay-target size (see ensure_gui_texture): a differently-sized
+    // full-frame target must persist this many consecutive GUI windows before it replaces the
+    // established capture, so a transient menu can't tear the textures down every frame.
+    static constexpr uint32_t GUI_SIZE_CHANGE_WINDOWS = 90; // ~1.5 s at 60 Hz
+    uint32_t m_pending_w{0};
+    uint32_t m_pending_h{0};
+    DXGI_FORMAT m_pending_format{DXGI_FORMAT_UNKNOWN};
+    uint32_t m_pending_count{0};
+
+    // Consecutive arm() calls (~one per frame) that carried a non-full-frame overlay target.
+    static constexpr uint32_t UI_SCREEN_IDLE_FRAMES = 10; // ~0.2 s; short enough not to be seen
+    std::atomic<uint32_t> m_idle_frames{0};
+
+    // Presents since the last completed GUI window. Starts stale so nothing is composited before
+    // the first real capture.
+    static constexpr uint32_t CAPTURE_STALE_FRAMES = 10;
+    std::atomic<uint32_t> m_frames_since_capture{CAPTURE_STALE_FRAMES};
 
     // Armed-frame resources (published at record time, consumed at translate time).
     std::atomic<ID3D12Resource*> m_overlay_target{nullptr};

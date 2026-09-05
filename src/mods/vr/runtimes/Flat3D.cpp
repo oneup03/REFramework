@@ -51,7 +51,11 @@ VRRuntime::Error Flat3D::update_matrices(float nearz, float farz) {
     // Same convention as OpenVR's GetEyeToHeadTransform: left eye sits at -x.
     // VR::on_camera_get_view_matrix applies these with the flipped-eye trick,
     // which handles the view-matrix inversion.
-    const auto half_sep = this->separation_eff * 0.5f;
+    //
+    // Under the clip-space parameterization the baseline is derived rather than stored - see the
+    // eye_half_offset comment in the header. update_flat3d_params() computes it from the live FoV
+    // and the applied convergence just before this runs.
+    const auto half_sep = this->eye_half_offset;
 
     this->eyes[(uint32_t)VRRuntime::Eye::LEFT] = glm::identity<Matrix4x4f>();
     this->eyes[(uint32_t)VRRuntime::Eye::LEFT][3] = Vector4f{-half_sep, 0.0f, 0.0f, 1.0f};

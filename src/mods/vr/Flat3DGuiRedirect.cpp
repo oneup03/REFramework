@@ -100,10 +100,83 @@ bool Flat3DGuiRedirect::init(ID3D12Device* device) {
     return true;
 }
 
+void Flat3DGuiRedirect::tick() {
+    // One call per present. A capture only counts as live while windows keep completing; the
+    // quest-rewards screen starves them entirely (measured: the 600-window counter log went silent
+    // for minutes while the screen was up), and compositing a capture nobody is refreshing any more
+    // is what paints a dead HUD layer over the screen.
+    const auto n = m_frames_since_capture.fetch_add(1, std::memory_order_acq_rel) + 1;
+
+    if (n == CAPTURE_STALE_FRAMES) {
+        spdlog::info("[Flat3D-GUIR] no GUI window completed for {} frames - dropping the GUI layer "
+            "(armed={} idle_frames={}); scene shift/zoom neutralised and AFW warp bypassed until it returns",
+            n, m_armed.load(std::memory_order_acquire), m_idle_frames.load(std::memory_order_acquire));
+    }
+}
+
+bool Flat3DGuiRedirect::is_full_frame_target(ID3D12Resource* target) {
+    if (target == nullptr) {
+        return false;
+    }
+
+    auto& hook = g_framework->get_d3d12_hook();
+
+    if (hook == nullptr) {
+        return true; // can't tell - assume yes rather than disabling the redirect outright
+    }
+
+    auto* swapchain = hook->get_swap_chain();
+
+    if (swapchain == nullptr) {
+        return true;
+    }
+
+    DXGI_SWAP_CHAIN_DESC sd{};
+
+    if (FAILED(swapchain->GetDesc(&sd)) || sd.BufferDesc.Width == 0 || sd.BufferDesc.Height == 0) {
+        return true;
+    }
+
+    const auto d = target->GetDesc();
+
+    // Half the backbuffer is the threshold rather than an exact match, so the engine's sub-region
+    // rendering under the native-output override still passes.
+    return d.Width * 2 >= sd.BufferDesc.Width && d.Height * 2 >= sd.BufferDesc.Height;
+}
+
 void Flat3DGuiRedirect::arm(ID3D12Resource* overlay_target, ID3D12Resource* marker_pre, ID3D12Resource* marker_post, uint32_t fresh_eye) {
     if (!m_hooks_installed || overlay_target == nullptr || marker_pre == nullptr || marker_post == nullptr) {
         disarm();
         return;
+    }
+
+    // The overlay layer does NOT always drive the full-frame HUD target. On the quest-rewards
+    // screen it drives a 320x320 icon target for EVERY window (measured: ~55 rejections/s against
+    // ~55 windows/s), and the real HUD target is never armed at all.
+    //
+    // Publishing that as m_overlay_target is actively harmful: substitution keys on
+    // (rtv_map[handle] == m_overlay_target), so every real HUD bind stops matching (the redirect
+    // goes idle and the UI stays in the engine's target = the scene texture), while an icon bind
+    // that DOES match gets our full-size GUI RTV swapped in - a 320x320 draw redirected into the
+    // 2560x1440 HUD texture, which the compose then samples at raw [0,1] as the whole HUD layer.
+    //
+    // So refuse it and keep the established target. Track how long we have gone without a
+    // full-frame target: that is the signal for "this is a full-screen UI screen" (see
+    // is_ui_screen), which the compose and the AFW warp both need.
+    if (!is_full_frame_target(overlay_target)) {
+        const auto idle = m_idle_frames.fetch_add(1, std::memory_order_acq_rel) + 1;
+
+        if (idle == UI_SCREEN_IDLE_FRAMES) {
+            spdlog::info("[Flat3D-GUIR] no full-frame overlay target for {} frames - treating this as a "
+                "full-screen UI screen (scene shift/zoom neutralised, AFW warp bypassed)", idle);
+        }
+
+        disarm();
+        return;
+    }
+
+    if (m_idle_frames.exchange(0, std::memory_order_acq_rel) >= UI_SCREEN_IDLE_FRAMES) {
+        spdlog::info("[Flat3D-GUIR] full-frame overlay target is back - resuming redirect + AFW warp");
     }
 
     if (m_window_active.exchange(false)) {
@@ -143,6 +216,10 @@ void Flat3DGuiRedirect::on_reset() {
     m_gui_format = DXGI_FORMAT_UNKNOWN;
     m_gui_w = 0;
     m_gui_h = 0;
+    m_pending_format = DXGI_FORMAT_UNKNOWN;
+    m_pending_w = 0;
+    m_pending_h = 0;
+    m_pending_count = 0;
     m_gui_in_rt_state = {};
     m_rtv_map.clear();
     m_shadows.clear();
@@ -181,8 +258,46 @@ void Flat3DGuiRedirect::ensure_gui_texture(ID3D12Resource* overlay_target) {
 
     if (m_gui_tex[0] != nullptr && m_gui_tex[1] != nullptr
         && m_gui_w == (uint32_t)src_desc.Width && m_gui_h == src_desc.Height && m_gui_format == fmt) {
+        m_pending_count = 0; // the established HUD target is still live this window
         return;
     }
+
+    // A size/format CHANGE while a capture already exists. Rebuilding on the spot is what makes
+    // certain full-screen menus (the quest-rewards screen) look zoomed AND stutter: when two
+    // differently-sized overlay targets alternate, every frame tears the textures down and
+    // rebuilds them at the other size, which
+    //   (a) resets m_captured, so the compose alternates between having and not having a GUI
+    //       (the stutter), and
+    //   (b) leaves the compose sampling a texture whose dimensions no longer match the HUD it
+    //       stands in for - the GUI is sampled at raw [0,1] with no content_frac (the zoom).
+    // Both targets pass the half-the-backbuffer size gate above, so that check cannot catch this.
+    // Require a new size to PERSIST before adopting it: a transient screen is ignored and the
+    // established HUD texture keeps being used, while a genuine permanent change still lands.
+    if (m_gui_tex[0] != nullptr && m_gui_tex[1] != nullptr) {
+        if (m_pending_w != (uint32_t)src_desc.Width || m_pending_h != src_desc.Height || m_pending_format != fmt) {
+            m_pending_w = (uint32_t)src_desc.Width;
+            m_pending_h = src_desc.Height;
+            m_pending_format = fmt;
+            m_pending_count = 0;
+
+            static uint32_t s_changes = 0;
+
+            if ((s_changes++ % 120) == 0) {
+                spdlog::info("[Flat3D-GUIR] overlay target {}x{} fmt {} differs from the established "
+                    "{}x{} fmt {} - holding the established capture [x{}]",
+                    m_pending_w, m_pending_h, (int)fmt, m_gui_w, m_gui_h, (int)m_gui_format, s_changes);
+            }
+        }
+
+        if (++m_pending_count < GUI_SIZE_CHANGE_WINDOWS) {
+            return;
+        }
+
+        spdlog::info("[Flat3D-GUIR] adopting {}x{} fmt {} after {} consecutive windows (established was {}x{})",
+            m_pending_w, m_pending_h, (int)fmt, m_pending_count, m_gui_w, m_gui_h);
+    }
+
+    m_pending_count = 0;
 
     for (auto& t : m_gui_tex) {
         t.Reset();
@@ -320,6 +435,7 @@ void Flat3DGuiRedirect::end_window(ID3D12GraphicsCommandList* list) {
         list->ResourceBarrier(1, &b);
         m_gui_in_rt_state[eye] = false;
         m_captured[eye].store(true, std::memory_order_release);
+        m_frames_since_capture.store(0, std::memory_order_release);
     }
 
     // Re-bind what the engine last set on this list (pre-substitution values) so any pass that

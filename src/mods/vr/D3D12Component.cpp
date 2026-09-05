@@ -381,6 +381,10 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         DXGI_SWAP_CHAIN_DESC swap_desc{};
         swapchain->GetDesc(&swap_desc);
 
+        // Age the GUI-redirect capture before anything reads it: a capture that is no longer being
+        // refreshed must not be composited, and must put the scene/AFW into the UI-screen fallback.
+        Flat3DGuiRedirect::get().tick();
+
         // AFW: warp the missing AFR eye from this frame's fresh render + harvested depth/MV, into the
         // stale eye's cache, BEFORE the compose reads the pair.
         run_flat3d_afw(vr, backbuffer_index);
@@ -881,6 +885,17 @@ void D3D12Component::run_flat3d_afw(VR* vr, uint32_t backbuffer_index) {
         return;
     }
 
+    // Full-screen UI screen (quest rewards and friends): the world is frozen, so the harvested
+    // depth/MV are stale or degenerate and warping the missing eye from them mangles it - a
+    // different way every frame, which is the violent full-screen flicker. Bypassing the warp
+    // leaves the stale eye holding the previous frame, and on frozen geometry that is the same
+    // image, so the pair reads as mono - correct for a flat 2D panel, and steady.
+    // Leaving early also keeps m_flat3d_afw_ui_tex null (cleared above), so the compose does not
+    // paint the last captured HUD over the screen either.
+    if (Flat3DGuiRedirect::get().is_ui_screen()) {
+        return;
+    }
+
     auto& afw = vr->m_flat3d_afw;
     auto* renderer = afw.renderer();
 
@@ -1104,7 +1119,11 @@ void D3D12Component::run_flat3d_afw(VR* vr, uint32_t backbuffer_index) {
     // once, the available one serves both halves.
     auto* gui_tex_l = Flat3DGuiRedirect::get().gui_texture(0);
     auto* gui_tex_r = Flat3DGuiRedirect::get().gui_texture(1);
-    const bool gui_redirect = gui_tex_l != nullptr || gui_tex_r != nullptr; // always on once capturing
+    // On once capturing - but ONLY while the capture is still being refreshed. A screen that
+    // starves the GUI windows (quest rewards) would otherwise keep the last capture painted over
+    // everything at HUD depth; the baked ExtractUI path below takes over instead.
+    const bool gui_redirect = (gui_tex_l != nullptr || gui_tex_r != nullptr)
+        && Flat3DGuiRedirect::get().capture_is_fresh();
     if (gui_tex_l == nullptr) {
         gui_tex_l = gui_tex_r;
     }
@@ -1253,7 +1272,7 @@ void D3D12Component::run_flat3d_afw(VR* vr, uint32_t backbuffer_index) {
                     if (SUCCEEDED(m_afw_depth_readback->Map(0, &rr, &mapped)) && mapped != nullptr) {
                         spdlog::info("[Flat3D-AFW] MV burst: pts=(c,n85,q,t) dims={}x{} mv_scale_raw=({:.1f},{:.1f}) sep={:.4f} conv={:.3f} p00={:.4f}",
                             w, h, afw.ngx_mv_scale_raw[0], afw.ngx_mv_scale_raw[1],
-                            vr->m_flat3d->separation_eff, vr->m_flat3d->convergence, vr->m_flat3d_game_p00.load());
+                            vr->m_flat3d->separation, vr->m_flat3d->convergence, vr->m_flat3d_game_p00.load());
 
                         for (uint32_t bf = 0; bf < 8; ++bf) {
                             const auto* bytes = (const uint8_t*)mapped + 2048ull * bf;
@@ -1424,13 +1443,13 @@ void D3D12Component::run_flat3d_afw(VR* vr, uint32_t backbuffer_index) {
         const auto& e0 = vr->get_runtime()->eyes[0];
         const auto& e1 = vr->get_runtime()->eyes[1];
         spdlog::info("[Flat3D-AFW] state: rfc={} fc={} fresh={} | view0.t=({:.4f},{:.4f},{:.4f}) view1.t=({:.4f},{:.4f},{:.4f}) | "
-            "shear0={:.5f} shear1={:.5f} | eyes0.x={:.4f} eyes1.x={:.4f} | sep_eff={:.4f} conv={:.3f}",
+            "shear0={:.5f} shear1={:.5f} | eyes0.x={:.4f} eyes1.x={:.4f} | sep={:.4f} conv={:.3f}",
             vr->m_render_frame_count, vr->m_frame_count, fresh,
             view_src[3].x, view_src[3].y, view_src[3].z,
             view_dst[3].x, view_dst[3].y, view_dst[3].z,
             proj_src[2][0], proj_dst[2][0],
             e0[3].x, e1[3].x,
-            vr->m_flat3d->separation_eff, vr->m_flat3d->convergence);
+            vr->m_flat3d->separation, vr->m_flat3d->convergence);
         // Projection convention check vs the plugin's expectation (UEVR feeds to_reverseZ'd UE
         // projections: reversed-Z, RH -Z-forward => P22=0-ish, P23=near-ish, P32=-1).
         spdlog::info("[Flat3D-AFW] proj conv: P00={:.4f} P11={:.4f} P22={:.6f} P23={:.6f} P32={:.4f} P33={:.4f} | ring_d={}",
@@ -1821,16 +1840,37 @@ Flat3DCompose::RepackParams D3D12Component::build_flat3d_params(VR* vr, uint32_t
         }
     }
 
+    // dynamic3d 6.1: pop-out is NOT divergence, so a depth-shifted overlay needs two DIFFERENT
+    // caps. Behind the screen plane the constraint is physical - uncrossed disparity past IPD
+    // forces the eyes outward and cannot be fused at any comfort level - so ~0.05 eye-widths per
+    // eye is right. In front the eyes converge inward, there is nothing to protect against, and
+    // reusing the behind cap would merely clip valid pop-out (the symptom reads as "the HUD
+    // stopped tracking depth", not as clipping).
+    //
+    // Branch on the RAW (1/z - 1/conv) term, never on the sign of the shift: shear_dir_left is
+    // folded into the shift below, so its sign encodes WHICH EYE, not near-vs-far.
+    constexpr float LIMIT_NEAR = 0.15f;   // in front of the screen plane
+    constexpr float LIMIT_BEHIND = 0.05f; // behind it; ~IPD/screen_width per eye
+    const auto clamp_disparity = [](float shift_uv, float raw) {
+        const auto lim = raw > 0.0f ? LIMIT_NEAR : LIMIT_BEHIND;
+        return std::clamp(shift_uv, -lim, lim);
+    };
+
     // AFW renders PARALLEL (shear-free) projections - convergence applies HERE instead, as the
     // symmetric-projection compose shift (a uniform per-eye image shift is exactly what the shear
     // did to the image), with cover-zoom hiding the revealed edges. Keeps the warp
     // translation-only (the plugin's model) and puts the skybox at proper infinity depth in BOTH
     // eyes. Sign follows the shear's validated convention (shear_dir_left).
-    if (vr->is_using_flat3d_afw()) {
-        const auto p00 = vr->m_flat3d_game_p00.load();
-        const auto sep = vr->m_flat3d->separation_eff;
-        const auto conv = std::max(vr->m_flat3d->convergence, 0.01f);
-        const float s = (sep * 0.5f / conv) * p00 * 0.5f; // shear NDC offset -> UV units
+    // On a full-screen UI screen the engine bakes the UI into the scene target (the redirect has
+    // no full-frame HUD target to capture from), so the scene's shift + cover-zoom would overscan
+    // the UI by 1 + separation. Imperceptible on a 3D scene, glaring on a flat 2D panel - which is
+    // exactly the "GUI looks overscanned" symptom. Hold the scene at identity instead.
+    if (vr->is_using_flat3d_afw() && !Flat3DGuiRedirect::get().is_ui_screen()) {
+        const auto sep = vr->m_flat3d->separation;
+        // shift_px at z = infinity, in eye-UV units: separation * (conv/inf - 1) * 0.5.
+        // Clip space deletes the P00 and 1/conv terms the metres form needed here, so the scene
+        // shift is already convergence-invariant.
+        const float s = sep * 0.5f;
         params.scene_shift_uv = (vr->m_flat3d->shear_dir_left > 0.0f) ? -s : s;
         // Cover-zoom hides the shift-revealed edge strips. Only the SCENE zooms - the extracted
         // GUI is composited at raw coords (native size); black-bar fallback stays for any
@@ -1838,24 +1878,31 @@ Flat3DCompose::RepackParams D3D12Component::build_flat3d_params(VR* vr, uint32_t
         params.scene_scale = 1.0f + 2.0f * std::abs(params.scene_shift_uv);
 
         // Overlay-RT redirect: composite the captured GUI texture into BOTH halves at the GUI
-        // plane's disparity. Same formula family as the scene shift: content at depth d nets
-        // sep*p00*0.25*(1/d - 1/conv) per eye after the compose shift, which equals
-        // scene_shift_uv * (1 - conv/d) - at d=inf the GUI moves exactly like the shifted-to-
-        // infinity scene, at d=conv it sits on the screen plane.
+        // plane's disparity.
+        //
+        // GUI depth is expressed as a MULTIPLE of convergence (dynamic3d 5.2), not in metres, and
+        // that makes convergence cancel out of the disparity entirely:
+        //     shift = separation * (conv/(f*conv) - 1) * 0.5 = separation * (1/f - 1) * 0.5
+        // so both the GUI's shift AND its fit-scale are convergence-invariant. With an absolute
+        // metres depth they were not: auto-convergence retunes convergence every frame, so the
+        // whole HUD slid and continuously resized itself as the scene's near depth changed.
+        // f = 1 puts the GUI exactly on the screen plane (zero shift, no squish at all);
+        // f < 1 pulls it in front, f > 1 pushes it behind.
         if (m_flat3d_afw_ui_tex != nullptr) {
-            // Clamp to the slider range (a persisted value from the old 15 m range may exceed it).
-            const float d = std::clamp(vr->m_ui_distance_option->value(), 0.05f, 8.0f);
+            const float f = std::max(vr->m_flat3d_gui_depth_factor->value(), 0.05f);
             params.ui_enabled = vr->m_flat3d_afw_debug->value() ? 2 : 1; // 2 = alpha-channel debug view
-            params.ui_shift_uv = params.scene_shift_uv * (1.0f - conv / d);
+            // The raw near/far term is (1/(f*conv) - 1/conv); all the clamp needs is its SIGN,
+            // which is just the sign of (1/f - 1) - so convergence drops out of the branch too.
+            params.ui_shift_uv = clamp_disparity(params.scene_shift_uv * (1.0f - 1.0f / f), 1.0f / f - 1.0f);
             // Horizontal fit-squish about center so the plane shift can't clip the GUI's sides
             // (dynamic3d "fit": shrink the overlay, never crop it). Floor guards degenerate math.
             params.ui_fit_scale = std::max(1.0f - 2.0f * std::abs(params.ui_shift_uv), 0.7f);
         }
     }
 
-    // Depth-aware dynamic crosshair (own-reticle): per-eye shift computed from
-    // the sampled center depth via the shift_px formula in eye-UV units:
-    // shift_uv = (sep * P00 * 0.25) * (1/z - 1/conv).
+    // Depth-aware dynamic crosshair (own-reticle): per-eye shift computed from the sampled center
+    // depth via the clip-space shift_px formula in eye-UV units:
+    // shift_uv = separation * (conv/z - 1) * 0.5.
     if (vr->m_flat3d_dynamic_crosshair->value() && params.eye_size[1] > 0) {
         params.crosshair_enabled = 1;
 
@@ -1865,14 +1912,15 @@ Flat3DCompose::RepackParams D3D12Component::build_flat3d_params(VR* vr, uint32_t
             z = vr->m_flat3d_crosshair_depth->value(); // static fallback
         }
 
-        const auto p00 = vr->m_flat3d_game_p00.load();
-        const auto sep = vr->m_flat3d->separation_eff;
+        z = std::max(z, 0.01f);
+
+        const auto sep = vr->m_flat3d->separation;
         const auto conv = std::max(vr->m_flat3d->convergence, 0.01f);
 
-        auto shift_uv = (sep * p00 * 0.25f) * (1.0f / std::max(z, 0.01f) - 1.0f / conv);
+        auto shift_uv = clamp_disparity(sep * 0.5f * (conv / z - 1.0f), 1.0f / z - 1.0f / conv);
 
         // The compositor shift sign is INDEPENDENT of the projection shear sign
-        // (dynamic3d 1.3) - each gets its own empirical flip toggle.
+        // (dynamic3d 1.4) - each gets its own empirical flip toggle.
         if (vr->m_flat3d_swap_shift_sign->value()) {
             shift_uv = -shift_uv;
         }
@@ -1881,6 +1929,12 @@ Flat3DCompose::RepackParams D3D12Component::build_flat3d_params(VR* vr, uint32_t
         params.crosshair_len_px = std::max(8.0f, (float)params.eye_size[1] * 0.012f);
         params.crosshair_thick_px = std::max(1.5f, (float)params.eye_size[1] * 0.0018f);
     }
+
+    // Ghost/crosstalk reduction (output3d 3.4): applied LAST in the compose shader, after every
+    // other colour operation, so what gets range-compressed is what actually reaches the display.
+    // Both levers are exact no-ops at their defaults (1.0 / 0.0) and the shader branches on that.
+    params.ghost_contrast = vr->m_flat3d_ghost_contrast->value();
+    params.ghost_black_floor = vr->m_flat3d_ghost_black_floor->value();
 
     // (GUI-match compose removed with flat3d multipass; HUD depth will return via per-eye UI
     // compositing.)

@@ -311,8 +311,12 @@ void VR::on_camera_get_projection_matrix(REManagedObject* camera, Matrix4x4f* re
         // ignores the shear, which parked the skybox at screen depth in the warped eye. Convergence
         // moves to the compose as the equivalent per-eye image shift (build_flat3d_params), applied
         // identically to both eyes - infinity lands at proper depth in both.
+        //
+        // Clip-space form (dynamic3d 1.1): the shear IS the knob. No P00, no convergence - the
+        // shear is invariant under convergence, and everything convergence does lives in the
+        // matching (derived) view-space eye translation instead.
         if (!is_using_flat3d_afw()) {
-            (*result)[2][0] += dir * (m_flat3d->separation_eff * 0.5f / m_flat3d->convergence) * (*result)[0][0];
+            (*result)[2][0] += dir * m_flat3d->separation;
         }
 
         // AFW: record BOTH eyes' projections same-tick (this pass's sheared one + the opposite
@@ -326,7 +330,7 @@ void VR::on_camera_get_projection_matrix(REManagedObject* camera, Matrix4x4f* re
             } else {
                 m_afw_frame.proj[e] = *result;
                 m_afw_frame.proj[e ^ 1] = pre_shear;
-                m_afw_frame.proj[e ^ 1][2][0] += -dir * (m_flat3d->separation_eff * 0.5f / m_flat3d->convergence) * pre_shear[0][0];
+                m_afw_frame.proj[e ^ 1][2][0] += -dir * m_flat3d->separation;
             }
         }
         return;
@@ -1414,32 +1418,19 @@ void VR::update_flat3d_params() {
     // Always on under flat3d (the option is retired).
     D3D12Hook::s_force_native_resolution.store(is_using_flat3d());
 
-    // FoV-aware separation auto-scaling (always on): screen disparity scales
-    // with sep / tan(half_fov), so scaling the Depth setting by
-    // tan(half_fov_now) / tan(half_fov_reference) keeps perceived depth
-    // constant when the game zooms (aim, cutscenes).
-    const auto p11 = m_flat3d_game_p11.load();
-    auto fov_scale = 1.0f;
-
-    if (p11 > 0.0f) {
-        const auto tan_half_game = 1.0f / p11;
-        const auto tan_half_ref = std::tan(glm::radians(m_flat3d_reference_fov->value()) * 0.5f);
-
-        if (tan_half_ref > 0.0f && tan_half_game > 0.0f) {
-            fov_scale = tan_half_game / tan_half_ref;
-        }
-    }
-
-    // EMA smooths hard FoV cuts (cutscene transitions, weapon zoom pops).
-    m_flat3d_fov_scale_ema += (fov_scale - m_flat3d_fov_scale_ema) * 0.2f;
-
-    auto sep_eff = m_flat3d_depth->value() * m_flat3d_fov_scale_ema;
+    // No FoV compensation exists any more (dynamic3d 3): separation is a CLIP-SPACE quantity, so
+    // it is FoV-independent by construction. The old tan(fov_game/2)/tan(fov_ref/2) auto-scale was
+    // multiplying in a term the projection's own P00 divided straight back out, and its EMA left
+    // depth measurably wrong for several frames after every hard FoV cut. Both are gone; the
+    // clip-space form is exact on the first frame.
+    const auto separation = m_flat3d_separation->value();
     const auto manual_conv = std::max(m_flat3d_convergence->value(), 0.01f); // a distance: no FoV term
     auto conv_applied = manual_conv;
 
-    // Auto-convergence (dynamic3d 3.3-3.5): pull convergence in so the nearest
-    // significant object stays under the pop-out budget, while co-scaling
-    // separation so BACKGROUND disparity stays locked at the user's calibration.
+    // Auto-convergence (dynamic3d 4): pull convergence in so the nearest significant object stays
+    // under the pop-out budget. Under clip space this is the WHOLE loop - background disparity is
+    // just `separation`, which convergence does not touch, so there is no longer any need to
+    // co-scale separation to lock the background (the old depth_scale output is gone).
     const auto z_near_raw = m_flat3d_auto_convergence->value() ? m_flat3d_depth_sampler.get_nearest_depth() : -1.0f;
 
     if (z_near_raw > 0.0f) {
@@ -1460,17 +1451,19 @@ void VR::update_flat3d_params() {
             m_flat3d_znear_ema += (z_median - m_flat3d_znear_ema) * alpha;
         }
 
-        const auto p00 = m_flat3d_game_p00.load();
-        const auto k = sep_eff * p00 * 0.25f; // per-eye shift as a fraction of eye width
-
-        if (k > 0.0f && m_flat3d_znear_ema > 0.0f) {
+        // Guard on separation, not P00 - P00 no longer appears in this math, and a zero separation
+        // would divide by zero in the solve below.
+        if (separation > 0.0f && m_flat3d_znear_ema > 0.0f) {
             const auto target = m_flat3d_max_popout->value() * 0.01f;
-            const auto d_at_manual = k * (1.0f / m_flat3d_znear_ema - 1.0f / manual_conv);
+
+            // Pop-out (crossed) disparity of the nearest object as a fraction of eye width,
+            // POSITIVE when nearer than the screen plane: d(conv) = (separation/2) * (conv/z - 1).
+            const auto d_at_manual = separation * 0.5f * (manual_conv / m_flat3d_znear_ema - 1.0f);
 
             auto conv_target = manual_conv; // manual value is a CEILING - auto only pulls IN
 
             if (d_at_manual > target) {
-                conv_target = m_flat3d_znear_ema * (1.0f + target * manual_conv / k);
+                conv_target = m_flat3d_znear_ema * (1.0f + 2.0f * target / separation);
                 conv_target = std::min(conv_target, manual_conv);
             }
 
@@ -1487,10 +1480,6 @@ void VR::update_flat3d_params() {
             }
 
             conv_applied = std::min(1.0f / m_flat3d_inv_conv_ema, manual_conv);
-
-            // Lock background disparity: sep_eff/conv_applied == sep/manual_conv.
-            const auto depth_scale = std::clamp(conv_applied / manual_conv, 0.1f, 1.0f);
-            sep_eff *= depth_scale;
         }
     } else if (m_flat3d_inv_conv_ema > 0.0f || m_flat3d_znear_ema > 0.0f) {
         // Disabled or no depth data: snap back to manual instantly and reset
@@ -1501,8 +1490,15 @@ void VR::update_flat3d_params() {
         m_flat3d_znear_history_idx = 0;
     }
 
-    m_flat3d->separation_eff = sep_eff;
+    // Derived view-space baseline: 2 * separation * tan(half_hfov) * conv, halved per eye. This is
+    // what pins zero parallax at `convergence` while the shear stays fixed at `separation`, and it
+    // is why the physical eye offset now moves with both the live FoV and the applied convergence.
+    const auto p00 = m_flat3d_game_p00.load();
+    const auto tan_half_h = p00 > 0.0f ? 1.0f / p00 : 1.0f;
+
+    m_flat3d->separation = separation;
     m_flat3d->convergence = conv_applied;
+    m_flat3d->eye_half_offset = separation * tan_half_h * conv_applied;
     m_flat3d->shear_dir_left = m_flat3d_swap_shear_sign->value() ? -1.0f : 1.0f;
 }
 
@@ -5103,9 +5099,35 @@ void VR::draw_flat3d_ui() {
     }
 
     m_flat3d_eye_swap->draw("Swap Eyes");
-    m_flat3d_depth->draw("Depth (Separation)");
+    m_flat3d_separation->draw("Depth (Separation)");
+
+    if (ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted("Clip-space separation: total background disparity as a fraction of the");
+        ImGui::TextUnformatted("screen width. 0.05 puts objects at infinity 5% of the screen apart.");
+        ImGui::TextUnformatted("It is FoV-independent, so zooming no longer changes the 3D effect.");
+        ImGui::TextUnformatted("Above about IPD / screen width (~0.105 on a 27-inch 16:9) the eyes");
+        ImGui::TextUnformatted("have to diverge and the image cannot be fused at all.");
+        ImGui::EndTooltip();
+    }
+
+    // Divergence is a hard physical limit, not a taste one - warn once the value is in that band.
+    if (m_flat3d_separation->value() > 0.105f) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.6f, 0.0f, 1.0f));
+        ImGui::TextWrapped("WARNING: separation above ~0.105 exceeds IPD/screen-width on a typical 27-inch 16:9 "
+                           "display - backgrounds will force your eyes to diverge and stop fusing.");
+        ImGui::PopStyleColor();
+    }
+
     m_flat3d_convergence->draw("Convergence");
-    m_flat3d_reference_fov->draw("Reference FOV");
+
+    if (ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted("Distance to the screen plane, in metres. Under clip space this no longer");
+        ImGui::TextUnformatted("changes background depth (that is fixed by Separation) - it only moves");
+        ImGui::TextUnformatted("what sits in FRONT of the screen.");
+        ImGui::EndTooltip();
+    }
 
     // Live game FOV readout (recorded from the projection hook; vfov = 2*atan(1/P11)).
     {
@@ -5123,6 +5145,36 @@ void VR::draw_flat3d_ui() {
 
     m_flat3d_crop_eyes_169->draw("Crop Eyes to 16:9 (SbS/TaB)");
 
+    if (ImGui::TreeNode("Ghosting / Crosstalk")) {
+        ImGui::TextWrapped("Two compose-time range-compression levers against ghosting (a faint copy of the other "
+                           "eye bleeding through). Which one wins is panel- and content-dependent; both are off at "
+                           "their defaults.");
+
+        m_flat3d_ghost_contrast->draw("Contrast (1.0 = off)");
+
+        if (ImGui::IsItemHovered()) {
+            ImGui::BeginTooltip();
+            ImGui::TextUnformatted("Squeezes the image toward mid-grey, shrinking the brightness difference");
+            ImGui::TextUnformatted("between the eyes - which is what makes the leak visible. Costs contrast");
+            ImGui::TextUnformatted("across the whole image. Try 0.90 first, lower only if edges still ghost.");
+            ImGui::EndTooltip();
+        }
+
+        m_flat3d_ghost_black_floor->draw("Black Floor (0.0 = off)");
+
+        if (ImGui::IsItemHovered()) {
+            ImGui::BeginTooltip();
+            ImGui::TextUnformatted("Raises the black floor and leaves white alone. Displays that CANCEL crosstalk");
+            ImGui::TextUnformatted("(LeiaSR and other autostereo panels) pre-subtract the other eye, which clips");
+            ImGui::TextUnformatted("at the BOTTOM of the range - and the clipped part is what survives as a ghost.");
+            ImGui::TextUnformatted("This gives that subtraction room to work. Try 0.02-0.05; blacks go grey fast");
+            ImGui::TextUnformatted("above that. Only helps on displays that actually cancel.");
+            ImGui::EndTooltip();
+        }
+
+        ImGui::TreePop();
+    }
+
     ImGui::TextDisabled("AFW plugin: %s", m_flat3d_afw.status());
     m_flat3d_afw_enabled->draw("AFW: warp missing AFR eye (needs AFR technique + plugin)");
     if (m_flat3d_afw_enabled->value() && m_flat3d_afw.is_available()) {
@@ -5136,7 +5188,17 @@ void VR::draw_flat3d_ui() {
         m_flat3d_afw_plugin_debug->draw("  AFW: plugin debug view (changes rendering)");
     }
 
-    m_ui_distance_option->draw("GUI depth (m)");
+    m_flat3d_gui_depth_factor->draw("GUI depth (x convergence)");
+
+    if (ImGui::IsItemHovered()) {
+        ImGui::BeginTooltip();
+        ImGui::TextUnformatted("Depth of the HUD plane as a multiple of convergence.");
+        ImGui::TextUnformatted("1.0 = exactly on the screen plane (no shift, no squish).");
+        ImGui::TextUnformatted("Below 1 pulls the HUD in front of the screen, above 1 pushes it behind.");
+        ImGui::TextUnformatted("Expressed this way convergence cancels out, so the HUD keeps a fixed");
+        ImGui::TextUnformatted("size and position even while auto-convergence is moving convergence.");
+        ImGui::EndTooltip();
+    }
 
     if (ImGui::TreeNode("Auto-Convergence & Crosshair")) {
         m_flat3d_auto_convergence->draw("Auto-Convergence");
@@ -5151,7 +5213,8 @@ void VR::draw_flat3d_ui() {
 
         if (nearest > 0.0f || center > 0.0f) {
             ImGui::Text("Depth samples: nearest %.2f m, center %.2f m", nearest, center);
-            ImGui::Text("Applied: convergence %.3f m, separation %.4f m", m_flat3d->convergence, m_flat3d->separation_eff);
+            ImGui::Text("Applied: convergence %.3f m, separation %.4f (eye offset %.4f m)",
+                m_flat3d->convergence, m_flat3d->separation, m_flat3d->eye_half_offset * 2.0f);
         } else if (m_flat3d_auto_convergence->value() || m_flat3d_dynamic_crosshair->value()) {
             ImGui::TextWrapped("No depth samples yet (depth buffer not located or readback pending).");
         }
@@ -5241,6 +5304,75 @@ void VR::on_device_reset() {
     }
 }
 
+void VR::migrate_flat3d_separation(const utility::Config& cfg) {
+    // One-shot conversion from the old eye-separation-in-metres parameterization to clip space
+    // (dynamic3d 2.2). Fires only when the new key is absent AND an old one is present, so it runs
+    // exactly once and never touches an already-converted profile.
+    if (cfg.get<float>(m_flat3d_separation->get_config_name()).has_value()) {
+        return;
+    }
+
+    const auto old_depth = cfg.get<float>(generate_name("Flat3D_Depth"));
+    const auto old_ref_fov = cfg.get<float>(generate_name("Flat3D_ReferenceFOV"));
+
+    if (!old_depth.has_value()) {
+        return; // fresh profile: the new default stands
+    }
+
+    // Expand the old form and the game's own tan(half_fov) cancels exactly, leaving a constant -
+    // and that constant IS the clip-space separation:
+    //   old shear = dir * (sep_m * (tan_half_game/tan_half_ref) * 0.5 / conv) * (1/tan_half_game)
+    //             = dir * sep_m / (2 * conv * tan_half_ref)
+    // There is no world-scale multiplier in this codebase, so nothing to fold in.
+    const auto conv = std::max(m_flat3d_convergence->value(), 0.01f);
+    const auto ref_fov = old_ref_fov.value_or(m_flat3d_reference_fov_legacy_default);
+    const auto tan_half_ref = std::tan(glm::radians(ref_fov) * 0.5f);
+
+    if (tan_half_ref <= 0.0f) {
+        return;
+    }
+
+    const auto converted = *old_depth / (2.0f * conv * tan_half_ref);
+    const auto clamped = std::clamp(converted, m_flat3d_separation->range().x, m_flat3d_separation->range().y);
+
+    m_flat3d_separation->value() = clamped;
+
+    spdlog::info("[VR] Flat3D: migrated Depth {:.4f} m @ convergence {:.3f} m / reference FOV {:.1f} deg "
+                 "-> clip-space separation {:.4f}", *old_depth, conv, ref_fov, converted);
+
+    if (clamped != converted) {
+        // Exact only inside the slider range; past it we would be asking the user's eyes to diverge.
+        spdlog::warn("[VR] Flat3D: converted separation {:.4f} was outside the {:.2f}..{:.2f} range and was "
+                     "clamped to {:.4f} - the old setting exceeded the divergence limit", converted,
+                     m_flat3d_separation->range().x, m_flat3d_separation->range().y, clamped);
+    }
+}
+
+void VR::migrate_flat3d_gui_depth(const utility::Config& cfg) {
+    // One-shot conversion of the flat3d GUI plane from absolute metres (which shared VR's
+    // "2D UI Distance" slider) to a multiple of convergence, so the HUD stops tracking
+    // convergence (dynamic3d 5.2). Same guard as the separation migration: new key absent,
+    // old key present.
+    if (cfg.get<float>(m_flat3d_gui_depth_factor->get_config_name()).has_value()) {
+        return;
+    }
+
+    const auto old_distance = cfg.get<float>(m_ui_distance_option->get_config_name());
+
+    if (!old_distance.has_value()) {
+        return; // fresh profile: 1.0 (screen plane) stands
+    }
+
+    const auto conv = std::max(m_flat3d_convergence->value(), 0.01f);
+    const auto converted = *old_distance / conv;
+    const auto clamped = std::clamp(converted, m_flat3d_gui_depth_factor->range().x, m_flat3d_gui_depth_factor->range().y);
+
+    m_flat3d_gui_depth_factor->value() = clamped;
+
+    spdlog::info("[VR] Flat3D: migrated GUI depth {:.3f} m @ convergence {:.3f} m -> {:.3f} x convergence{}",
+        *old_distance, conv, clamped, clamped != converted ? " (clamped)" : "");
+}
+
 void VR::on_config_load(const utility::Config& cfg) {
     for (IModValue& option : m_options) {
         option.config_load(cfg);
@@ -5249,6 +5381,9 @@ void VR::on_config_load(const utility::Config& cfg) {
     if (m_flat3d != nullptr) {
         m_flat3d->enabled = true; // stereo always active (the Active toggle is retired)
     }
+
+    migrate_flat3d_separation(cfg);
+    migrate_flat3d_gui_depth(cfg);
 
     // Run the rest of OpenXR initialization code here that depends on config values
     if (get_runtime()->is_openxr() && get_runtime()->loaded) {

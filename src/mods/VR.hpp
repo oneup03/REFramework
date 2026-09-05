@@ -433,7 +433,9 @@ private:
     bool detect_controllers();
     bool is_any_action_down();
     void update_hmd_state();
-    void update_flat3d_params(); // separation/convergence/FoV auto-scale, before update_matrices
+    void update_flat3d_params(); // clip-space separation/convergence + derived eye baseline, before update_matrices
+    void migrate_flat3d_separation(const utility::Config& cfg); // one-shot metres -> clip-space conversion
+    void migrate_flat3d_gui_depth(const utility::Config& cfg);  // one-shot GUI metres -> x-convergence factor
     void draw_flat3d_ui(); // Flatscreen 3D section of on_draw_ui
     void update_action_states();
     void update_camera(); // if not in firstperson mode
@@ -794,9 +796,27 @@ public:
         }, FLAT3D_SBS)
     };
     const ModToggle::Ptr m_flat3d_eye_swap{ ModToggle::create(generate_name("Flat3D_EyeSwap"), false) };
-    const ModSlider::Ptr m_flat3d_depth{ ModSlider::create(generate_name("Flat3D_Depth"), 0.0f, 3.0f, 0.4f) };
+    // Clip-space separation (dynamic3d 1.3) is THE stereo knob: the projection shear IS this value,
+    // and it equals total BACKGROUND disparity as a fraction of the screen width. Being a clip-space
+    // quantity it is FoV-independent by construction, so the old reference-FoV slider and its
+    // tan(fov/2) auto-scale are gone - there is nothing left for them to compensate. The ceiling is
+    // divergence: disparity past IPD/screen_width (~0.105 on a 27" 16:9) cannot be fused at all.
+    const ModSlider::Ptr m_flat3d_separation{ ModSlider::create(generate_name("Flat3D_Separation"), 0.0f, 0.15f, 0.05f) };
     const ModSlider::Ptr m_flat3d_convergence{ ModSlider::create(generate_name("Flat3D_Convergence"), 0.01f, 4.0f, 2.5f) };
-    const ModSlider::Ptr m_flat3d_reference_fov{ ModSlider::create(generate_name("Flat3D_ReferenceFOV"), 10.0f, 120.0f, 70.0f) };
+    // Ghost/crosstalk reduction (output3d 3.4): two compose-time range-compression levers, both
+    // exact no-ops at their defaults. Contrast squeezes toward mid-grey, shrinking |L-R| directly;
+    // black floor raises the bottom of the range, which is where a cancelling display (LeiaSR)
+    // clips - and the clipped part is exactly what survives as a ghost.
+    const ModSlider::Ptr m_flat3d_ghost_contrast{ ModSlider::create(generate_name("Flat3D_GhostContrast"), 0.5f, 1.0f, 1.0f) };
+    const ModSlider::Ptr m_flat3d_ghost_black_floor{ ModSlider::create(generate_name("Flat3D_GhostBlackFloor"), 0.0f, 0.15f, 0.0f) };
+    // GUI/HUD plane depth as a MULTIPLE of convergence, not metres (dynamic3d 5.2). Expressed this
+    // way, convergence cancels out of the GUI's disparity AND its fit-scale, so the HUD no longer
+    // slides or resizes itself while auto-convergence is retuning convergence every frame.
+    // 1 = exactly on the screen plane (zero shift, no squish); < 1 in front, > 1 behind.
+    const ModSlider::Ptr m_flat3d_gui_depth_factor{ ModSlider::create(generate_name("Flat3D_GuiDepthFactor"), 0.25f, 4.0f, 1.0f) };
+    // Default of the retired Flat3D_ReferenceFOV slider, kept only so a profile saved before that
+    // key existed still converts to the same picture. Not a live setting.
+    static constexpr float m_flat3d_reference_fov_legacy_default{70.0f};
     const ModToggle::Ptr m_flat3d_crop_eyes_169{ ModToggle::create(generate_name("Flat3D_CropEyesTo169"), false) };
     const ModToggle::Ptr m_flat3d_swap_shear_sign{ ModToggle::create(generate_name("Flat3D_SwapShearSign"), false) };
     const ModToggle::Ptr m_flat3d_auto_convergence{ ModToggle::create(generate_name("Flat3D_AutoConvergence"), false) };
@@ -878,7 +898,6 @@ public:
     // projection hook (render thread) and consumed by update_flat3d_params.
     std::atomic<float> m_flat3d_game_p00{1.0f};
     std::atomic<float> m_flat3d_game_p11{1.0f};
-    float m_flat3d_fov_scale_ema{1.0f};
 
     // Flat3D UI extraction (multipass): redirect the PRIMARY eye's Overlay draw into a private
     // transparent target so we capture the UI ONLY (icons/highlights/text), then composite it
@@ -945,9 +964,11 @@ public:
         *m_enable_asynchronous_rendering,
         *m_flat3d_output_mode,
         *m_flat3d_eye_swap,
-        *m_flat3d_depth,
+        *m_flat3d_separation,
         *m_flat3d_convergence,
-        *m_flat3d_reference_fov,
+        *m_flat3d_ghost_contrast,
+        *m_flat3d_ghost_black_floor,
+        *m_flat3d_gui_depth_factor,
         *m_flat3d_crop_eyes_169,
         *m_flat3d_swap_shear_sign,
         *m_flat3d_auto_convergence,
