@@ -135,7 +135,14 @@ jobs:
   nightly-push:
     runs-on: windows-latest
     needs: [dev-release, csharp-release]
-    if: github.ref == 'refs/heads/master'
+    # Fork retarget: publish the Flat3D branch's artifacts as a release on THIS repo.
+    # Upstream gates this on master and pushes to praydog/REFramework-nightly using a REPO_TOKEN
+    # that only exists there - on this fork that secret is unset, so the job could not have
+    # authenticated even if the branch gate had passed. Same-repo releases need no PAT at all.
+    if: github.ref == 'refs/heads/flat3d-output'
+    permissions:
+      # GITHUB_TOKEN defaults to read-only; creating a release needs contents: write.
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -156,11 +163,11 @@ jobs:
       - name: Create Release
         uses: ncipollo/release-action@6c75be85e571768fa31b40abf38de58ba0397db5
         with:
-          repo: REFramework-nightly
-          owner: praydog
-          token: ${{ secrets.REPO_TOKEN }}
-          name: ${{format('REF Nightly {0} ({1})', env.RUN_NUMBER, github.sha)}}
-          tag: ${{format('nightly-{0}-{1}', env.RUN_NUMBER, github.sha)}}
+          # owner/repo omitted on purpose -> the repo this workflow is running in, so the release
+          # follows the fork if it is ever renamed or transferred.
+          token: ${{ secrets.GITHUB_TOKEN }}
+          name: ${{format('Flat3D Nightly {0} ({1})', env.RUN_NUMBER, github.sha)}}
+          tag: ${{format('flat3d-nightly-{0}-{1}', env.RUN_NUMBER, github.sha)}}
           artifacts: ${{github.workspace}}/artifacts/**/*.zip
           makeLatest: true
           bodyFile: ${{github.workspace}}/nightly-body.md
